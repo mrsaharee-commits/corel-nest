@@ -1,1 +1,41 @@
+name: build-CorelNestEngine-dll
+
+# يبني CorelNestEngine.dll (64-بت) على خادم ويندوز بمترجم MSVC،
+# يشغّل الاختبار الذاتي، ثم يتيح الـ DLL للتنزيل كـ Artifact.
+# لا تحتاج أي أداة على جهازك.
+#
+# Builds CorelNestEngine.dll (x64) on a Windows runner with MSVC,
+# runs the self-test, and publishes the DLL as a downloadable artifact.
+
+on:
+  workflow_dispatch:      # زر تشغيل يدوي من تبويب Actions
+  push:                   # يبني تلقائياً عند رفع الملفات
+
+jobs:
+  build-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Configure (x64 / MSVC)
+        run: cmake -S . -B build -A x64
+        # لبناء نسخة 32-بت بدلاً من ذلك، استبدل السطر أعلاه بـ:
+        # run: cmake -S . -B build -A Win32
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Run self-test (nest_test)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: List output
+        run: dir build\Release
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CorelNestEngine-x64
+          path: build/Release/CorelNestEngine.dll
+          if-no-files-found: error
 
