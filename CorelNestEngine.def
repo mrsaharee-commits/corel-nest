@@ -1,0 +1,13 @@
+LIBRARY CorelNestEngine
+EXPORTS
+    CNE_Version
+    CNE_Begin
+    CNE_End
+    CNE_SetOptions
+    CNE_SetProgressCallback
+    CNE_AddPart
+    CNE_Run
+    CNE_GetPlacementCount
+    CNE_GetPlacement
+    CNE_GetSheetCount
+    CNE_GetFitness
