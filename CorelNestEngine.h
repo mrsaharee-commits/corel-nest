@@ -40,7 +40,7 @@
 typedef int32_t (CNE_CALL *CNE_ProgressFn)(int32_t percent);
 
 // ---- lifecycle -------------------------------------------------------------
-CNE_API int32_t CNE_CALL CNE_Version(void);   // 101 = v0.1.1
+CNE_API int32_t CNE_CALL CNE_Version(void);   // 102 = v0.1.2
 CNE_API int32_t CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                    double edgePad, double minDist);
 CNE_API int32_t CNE_CALL CNE_End(void);
@@ -49,10 +49,13 @@ CNE_API int32_t CNE_CALL CNE_End(void);
 //  fixAngleMode : 0 Auto{0,90,180,270} | 1 No{0} | 2 "90"{0,90,180,270}
 //                 3 "180"{0,180}       | 4 free rotation by rotStepDeg
 //  originCorner : 0 Left-bottom | 1 Right-bottom | 2 Left-top | 3 Right-top
-//  fitMode      : 0 Bottom (best) | 1 Width (best) | 2 Height (best)
+//  dirMode      : 0 = X (fill rows horizontally; parts prefer long side on X)
+//                 1 = Y (fill columns vertically; parts prefer long side on Y)
+//                 Preference is strict-with-fallback: non-matching rotations
+//                 are used only when no matching rotation fits.
 //  allowInside  : reserved (hole nesting arrives with the concave-NFP core, v0.2)
 CNE_API int32_t CNE_CALL CNE_SetOptions(int32_t fixAngleMode, double rotStepDeg,
-                                        int32_t originCorner, int32_t fitMode,
+                                        int32_t originCorner, int32_t dirMode,
                                         int32_t allowInside, int32_t searchBest,
                                         double searchTimerSec, int32_t searchCount,
                                         int32_t seed);

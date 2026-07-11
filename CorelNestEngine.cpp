@@ -155,13 +155,19 @@ std::vector<Pt> minkowskiConvex(std::vector<Pt> P, std::vector<Pt> Q) {
     return convexHull(R);                             // clean duplicates/collinear
 }
 
-// Outward inflation of a convex CCW polygon by r (miter, bevel on sharp spikes).
-// Used to guarantee the "Minimum distance" clearance: both polygons are
-// inflated by minDist/2, so touching NFP positions keep a full minDist gap.
+// Outward inflation of a convex CCW polygon by r.
+// Guarantees the "Minimum distance" clearance: the result always CONTAINS the
+// exact Minkowski sum (polygon + disk r).
+//   - small turns  -> exact miter point (lies outside the disk offset: safe)
+//   - sharp turns  -> CIRCUMSCRIBED arc join: tangent chords with vertices at
+//     r/cos(step/2), so no chord ever dips below distance r from the corner.
+// (The previous bevel join undershot by up to r at needle-sharp tips of thin
+//  strips, which let parts violate the minimum distance. Fixed in v0.1.2.)
 std::vector<Pt> offsetConvex(const std::vector<Pt>& v, double r) {
     if (r <= 1e-12 || v.size() < 3) return v;
     const size_t n = v.size();
-    std::vector<Pt> out; out.reserve(n * 2);
+    const double maxStep = PI / 6.0;                  // 30 deg per arc chord
+    std::vector<Pt> out; out.reserve(n * 4);
     for (size_t i = 0; i < n; ++i) {
         const Pt& prev = v[(i + n - 1) % n];
         const Pt& cur  = v[i];
@@ -173,21 +179,32 @@ std::vector<Pt> offsetConvex(const std::vector<Pt>& v, double r) {
         // outward normal of a CCW edge (dx,dy) is (dy,-dx)/len
         double n1x =  e1y / l1, n1y = -e1x / l1;
         double n2x =  e2y / l2, n2y = -e2x / l2;
-        // offset line 1: A1 + t*e1, offset line 2: A2 + s*e2
-        double a1x = prev.x + n1x * r, a1y = prev.y + n1y * r;
-        double a2x = cur.x  + n2x * r, a2y = cur.y  + n2y * r;
-        double denom = e1x * e2y - e1y * e2x;
-        if (std::fabs(denom) < 1e-12) {               // parallel edges
-            out.push_back({ cur.x + n1x * r, cur.y + n1y * r });
-            continue;
-        }
-        double t = ((a2x - a1x) * e2y - (a2y - a1y) * e2x) / denom;
-        double mx = a1x + t * e1x, my = a1y + t * e1y;
-        if (vlen(mx - cur.x, my - cur.y) > 3.0 * r + 1e-9) {   // miter too long
-            out.push_back({ cur.x + n1x * r, cur.y + n1y * r });
-            out.push_back({ cur.x + n2x * r, cur.y + n2y * r });
+        double a1 = std::atan2(n1y, n1x);
+        double sweep = std::atan2(n2y, n2x) - a1;     // exterior turn at cur
+        while (sweep < 0) sweep += 2.0 * PI;
+        if (sweep >= PI) sweep = PI;                  // convex safety clamp
+        if (sweep < maxStep) {
+            // exact miter (conservative: outside the disk offset)
+            double a1x = prev.x + n1x * r, a1y = prev.y + n1y * r;
+            double a2x = cur.x  + n2x * r, a2y = cur.y  + n2y * r;
+            double denom = e1x * e2y - e1y * e2x;
+            if (std::fabs(denom) < 1e-12) {           // parallel edges
+                out.push_back({ cur.x + n1x * r, cur.y + n1y * r });
+            } else {
+                double t = ((a2x - a1x) * e2y - (a2y - a1y) * e2x) / denom;
+                out.push_back({ a1x + t * e1x, a1y + t * e1y });
+            }
         } else {
-            out.push_back({ mx, my });
+            // circumscribed arc: touch points at radius r, chord vertices at rr
+            const int steps = (int)std::ceil(sweep / maxStep);
+            const double step = sweep / steps;
+            const double rr = r / std::cos(step * 0.5);
+            out.push_back({ cur.x + n1x * r, cur.y + n1y * r });
+            for (int k = 0; k < steps; ++k) {
+                const double am = a1 + step * (k + 0.5);
+                out.push_back({ cur.x + rr * std::cos(am), cur.y + rr * std::sin(am) });
+            }
+            out.push_back({ cur.x + n2x * r, cur.y + n2y * r });
         }
     }
     return safeHull(out);
@@ -245,7 +262,7 @@ void addBorderCrossings(const std::vector<Pt>& poly,
 struct Options {
     i32 fixAngleMode = 0; double rotStepDeg = 15.0;
     i32 originCorner = 0;          // 0 LB, 1 RB, 2 LT, 3 RT
-    i32 fitMode = 0;               // 0 Bottom, 1 Width, 2 Height
+    i32 dirMode = 0;               // 0 = X (horizontal), 1 = Y (vertical)
     i32 allowInside = 0;           // reserved for the concave/hole core (v0.2)
     i32 searchBest = 0; double searchTimerSec = 3.0; i32 searchCount = 4;
     i32 seed = 123456789;
@@ -354,58 +371,68 @@ const std::vector<Pt>& buildNfp(long long ka, int ra, long long kb, int rb) {
 
 struct Best { bool ok = false; double x = 0, y = 0, score = 1e300; double rotDeg = 0; };
 
-// Evaluate every allowed rotation ("aggressive rotation") on one sheet and
+// Evaluate the allowed rotations ("aggressive rotation") on one sheet and
 // return the best (rotation, position) by gravity score.
+// Orientation preference (Direction X/Y): pass 0 only considers rotations
+// whose bbox long side follows the chosen axis; rotations that break the
+// preference are considered in pass 1 ONLY if pass 0 found no placement.
 void considerSheet(const SheetState& sh, long long movKey,
                    const std::vector<double>& rots,
                    bool hasPref, double prefRot, Best& out) {
     const bool originRight = (G->opt.originCorner == 1 || G->opt.originCorner == 3);
     const bool originTop   = (G->opt.originCorner == 2 || G->opt.originCorner == 3);
-    for (double rot : rots) {
-        const RotGeom& rg = getRotGeom(movKey, rot);
-        // Inner-Fit rectangle for the sheet (exact for rectangular sheets)
-        const double x0 = G->edgePad, y0 = G->edgePad;
-        const double x1 = G->sheetW - G->edgePad - rg.bw;
-        const double y1 = G->sheetH - G->edgePad - rg.bh;
-        if (x1 < x0 - 1e-9 || y1 < y0 - 1e-9) continue;   // does not fit at all
-        const int rqMov = quantRot(rot);
-        // forbidden regions = translated NFPs of every placed instance
-        std::vector<NfpInst> nfps; nfps.reserve(sh.insts.size());
-        for (const PlacedInst& in : sh.insts) {
-            NfpInst f;
-            f.poly = translatePts(buildNfp(in.geomKey, in.rotQ, movKey, rqMov), in.x, in.y);
-            f.bb = bboxOf(f.poly);
-            nfps.push_back(std::move(f));
-        }
-        // candidate positions: IFP corners, NFP vertices, NFP x wall crossings
-        std::vector<Pt> cand;
-        cand.push_back({ x0, y0 }); cand.push_back({ x1, y0 });
-        cand.push_back({ x0, y1 }); cand.push_back({ x1, y1 });
-        for (const NfpInst& f : nfps) {
-            for (const Pt& p : f.poly) cand.push_back(p);
-            addBorderCrossings(f.poly, x0, y0, x1, y1, cand);
-        }
-        std::sort(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
-            if (a.x != b.x) return a.x < b.x;
-            return a.y < b.y; });
-        cand.erase(std::unique(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
-            return std::fabs(a.x - b.x) < 1e-7 && std::fabs(a.y - b.y) < 1e-7; }), cand.end());
-        for (const Pt& p : cand) {
-            if (p.x < x0 - 1e-9 || p.x > x1 + 1e-9 ||
-                p.y < y0 - 1e-9 || p.y > y1 + 1e-9) continue;
-            bool bad = false;
-            for (const NfpInst& f : nfps)
-                if (strictlyInside(f, p, 1e-7)) { bad = true; break; }
-            if (bad) continue;
-            const double ux = originRight ? (x1 - p.x) : (p.x - x0);
-            const double uy = originTop   ? (y1 - p.y) : (p.y - y0);
-            double primary, secondary;
-            if (G->opt.fitMode == 1) { primary = ux; secondary = uy; }   // Width (best)
-            else                     { primary = uy; secondary = ux; }   // Bottom / Height
-            double sc = primary * 1e7 + secondary;
-            if (hasPref && std::fabs(rot - prefRot) < 1e-9) sc -= 1e-3;  // align identical parts
-            if (sc < out.score) {
-                out.ok = true; out.score = sc; out.x = p.x; out.y = p.y; out.rotDeg = rot;
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1 && out.ok) break;               // preference satisfied
+        for (double rot : rots) {
+            const RotGeom& rg = getRotGeom(movKey, rot);
+            const bool matchesDir = (G->opt.dirMode == 1)
+                ? (rg.bh >= rg.bw - 1e-9)             // Y: long side vertical
+                : (rg.bw >= rg.bh - 1e-9);            // X: long side horizontal
+            if ((pass == 0) != matchesDir) continue;
+            // Inner-Fit rectangle for the sheet (exact for rectangular sheets)
+            const double x0 = G->edgePad, y0 = G->edgePad;
+            const double x1 = G->sheetW - G->edgePad - rg.bw;
+            const double y1 = G->sheetH - G->edgePad - rg.bh;
+            if (x1 < x0 - 1e-9 || y1 < y0 - 1e-9) continue;   // does not fit
+            const int rqMov = quantRot(rot);
+            // forbidden regions = translated NFPs of every placed instance
+            std::vector<NfpInst> nfps; nfps.reserve(sh.insts.size());
+            for (const PlacedInst& in : sh.insts) {
+                NfpInst f;
+                f.poly = translatePts(buildNfp(in.geomKey, in.rotQ, movKey, rqMov), in.x, in.y);
+                f.bb = bboxOf(f.poly);
+                nfps.push_back(std::move(f));
+            }
+            // candidates: IFP corners, NFP vertices, NFP x wall crossings
+            std::vector<Pt> cand;
+            cand.push_back({ x0, y0 }); cand.push_back({ x1, y0 });
+            cand.push_back({ x0, y1 }); cand.push_back({ x1, y1 });
+            for (const NfpInst& f : nfps) {
+                for (const Pt& p : f.poly) cand.push_back(p);
+                addBorderCrossings(f.poly, x0, y0, x1, y1, cand);
+            }
+            std::sort(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
+                if (a.x != b.x) return a.x < b.x;
+                return a.y < b.y; });
+            cand.erase(std::unique(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
+                return std::fabs(a.x - b.x) < 1e-7 && std::fabs(a.y - b.y) < 1e-7; }), cand.end());
+            for (const Pt& p : cand) {
+                if (p.x < x0 - 1e-9 || p.x > x1 + 1e-9 ||
+                    p.y < y0 - 1e-9 || p.y > y1 + 1e-9) continue;
+                bool bad = false;
+                for (const NfpInst& f : nfps)
+                    if (strictlyInside(f, p, 1e-7)) { bad = true; break; }
+                if (bad) continue;
+                const double ux = originRight ? (x1 - p.x) : (p.x - x0);
+                const double uy = originTop   ? (y1 - p.y) : (p.y - y0);
+                double primary, secondary;
+                if (G->opt.dirMode == 1) { primary = ux; secondary = uy; }  // Y: fill columns
+                else                     { primary = uy; secondary = ux; }  // X: fill rows
+                double sc = primary * 1e7 + secondary;
+                if (hasPref && std::fabs(rot - prefRot) < 1e-9) sc -= 1e-3; // align identical parts
+                if (sc < out.score) {
+                    out.ok = true; out.score = sc; out.x = p.x; out.y = p.y; out.rotDeg = rot;
+                }
             }
         }
     }
@@ -462,7 +489,7 @@ RunOut runOrder(const std::vector<int>& order,
         ++usedSheets;
         double ext = 0;
         for (const PlacedInst& in : sh.insts) {
-            const double e = (G->opt.fitMode == 1) ? (in.x + in.bw - G->edgePad)
+            const double e = (G->opt.dirMode == 1) ? (in.x + in.bw - G->edgePad)
                                                    : (in.y + in.bh - G->edgePad);
             ext = std::max(ext, e);
         }
@@ -497,7 +524,7 @@ std::vector<int> perturbOrder(const std::vector<int>& base) {
 // ===========================================================================
 // Exported C API
 // ===========================================================================
-CNE_API i32 CNE_CALL CNE_Version(void) { return 101; }
+CNE_API i32 CNE_CALL CNE_Version(void) { return 102; }
 
 CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                double edgePad, double minDist) {
@@ -512,7 +539,7 @@ CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
 CNE_API i32 CNE_CALL CNE_End(void) { delete G; G = nullptr; return 1; }
 
 CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
-                                    i32 originCorner, i32 fitMode,
+                                    i32 originCorner, i32 dirMode,
                                     i32 allowInside, i32 searchBest,
                                     double searchTimerSec, i32 searchCount,
                                     i32 seed) {
@@ -520,7 +547,7 @@ CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
     G->opt.fixAngleMode = fixAngleMode;
     G->opt.rotStepDeg = rotStepDeg;
     G->opt.originCorner = originCorner;
-    G->opt.fitMode = fitMode;
+    G->opt.dirMode = dirMode;
     G->opt.allowInside = allowInside;      // stored; active in the v0.2 concave core
     G->opt.searchBest = searchBest;
     G->opt.searchTimerSec = searchTimerSec;
