@@ -40,7 +40,7 @@
 typedef int32_t (CNE_CALL *CNE_ProgressFn)(int32_t percent);
 
 // ---- lifecycle -------------------------------------------------------------
-CNE_API int32_t CNE_CALL CNE_Version(void);   // 102 = v0.1.2
+CNE_API int32_t CNE_CALL CNE_Version(void);   // 103 = v0.2.0 (concave core)
 CNE_API int32_t CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                    double edgePad, double minDist);
 CNE_API int32_t CNE_CALL CNE_End(void);
@@ -53,7 +53,10 @@ CNE_API int32_t CNE_CALL CNE_End(void);
 //                 1 = Y (fill columns vertically; parts prefer long side on Y)
 //                 Preference is strict-with-fallback: non-matching rotations
 //                 are used only when no matching rotation fits.
-//  allowInside  : reserved (hole nesting arrives with the concave-NFP core, v0.2)
+//  allowInside  : 0 = convex-hull forbidden regions (fast, parts never enter
+//                     cavities or holes of other parts)
+//                 1 = EXACT concave forbidden regions via convex decomposition:
+//                     parts nest inside C/U cavities and inside holes
 CNE_API int32_t CNE_CALL CNE_SetOptions(int32_t fixAngleMode, double rotStepDeg,
                                         int32_t originCorner, int32_t dirMode,
                                         int32_t allowInside, int32_t searchBest,
@@ -62,8 +65,13 @@ CNE_API int32_t CNE_CALL CNE_SetOptions(int32_t fixAngleMode, double rotStepDeg,
 CNE_API int32_t CNE_CALL CNE_SetProgressCallback(CNE_ProgressFn fn);
 
 // ---- parts -----------------------------------------------------------------
-//  xy = flat array x0,y0,x1,y1,...  nPoints = number of (x,y) pairs.
+//  Preferred (v0.2): ring-structured outline. xy holds ALL rings back to back
+//  as x0,y0,x1,y1,...; ringSizes[i] = number of (x,y) pairs in ring i.
+//  Outer rings and holes are auto-classified (even-odd), any winding accepted.
 //  Returns internal index (>=0) or -1 on error.
+CNE_API int32_t CNE_CALL CNE_AddPartEx(int32_t partId, const double* xy,
+                                       const int32_t* ringSizes, int32_t ringCount);
+//  Legacy (v0.1): single point cloud, treated as one ring.
 CNE_API int32_t CNE_CALL CNE_AddPart(int32_t partId, const double* xy, int32_t nPoints);
 
 // ---- solve -----------------------------------------------------------------

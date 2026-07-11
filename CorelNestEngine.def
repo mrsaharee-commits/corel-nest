@@ -6,6 +6,7 @@ EXPORTS
     CNE_SetOptions
     CNE_SetProgressCallback
     CNE_AddPart
+    CNE_AddPartEx
     CNE_Run
     CNE_GetPlacementCount
     CNE_GetPlacement
