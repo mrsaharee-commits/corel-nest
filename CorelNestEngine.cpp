@@ -39,6 +39,7 @@
 #include <cmath>
 #include <chrono>
 #include <random>
+#include <cstdlib>
 
 namespace {
 
@@ -794,13 +795,19 @@ inline double gravityScore(double px, double py, double x0, double y0,
 // placement and the compaction pass.
 void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
                   double rot, bool hasPref, double prefRot, Best& out,
-                  bool fullCandidates = true) {
+                  bool fullCandidates = true,
+                  bool haveCur = false, double curX = 0, double curY = 0) {
     const RotGeom& rg = getRotGeom(movKey, rot);
     const double x0 = G->edgePad, y0 = G->edgePad;
     const double x1 = G->sheetW - G->edgePad - rg.bw;
     const double y1 = G->sheetH - G->edgePad - rg.bh;
     if (x1 < x0 - 1e-9 || y1 < y0 - 1e-9) return;
     const int rqMov = quantRot(rot);
+    // gentle tie-break: prefer the Direction orientation (X->landscape,
+    // Y->portrait) only when the fit is otherwise equal (a few mm).
+    const bool matchesDir = (G->opt.dirMode == 1) ? (rg.bh >= rg.bw - 1e-9)
+                                                   : (rg.bw >= rg.bh - 1e-9);
+    const double dirBias = matchesDir ? 0.0 : 3.0;
 
     std::vector<NfpInst> nfps; nfps.reserve(insts.size());
     std::vector<char> instIsContainer; instIsContainer.reserve(insts.size());
@@ -821,6 +828,23 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
         }
         nfps.push_back(std::move(f));
         instIsContainer.push_back(in.phantom ? 1 : 0);
+    }
+
+    // current "skyline": the farthest edge of already-placed real parts along
+    // the gravity axis, measured from the origin. Candidates that stay under
+    // this skyline (fill a notch) beat candidates that push it out.
+    const bool originRight = (G->opt.originCorner == 1 || G->opt.originCorner == 3);
+    const bool originTop   = (G->opt.originCorner == 2 || G->opt.originCorner == 3);
+    auto farEdge = [&](double ref, double size, double sheetDim, bool originFar) {
+        return originFar ? (sheetDim - G->edgePad - ref) : (ref + size - G->edgePad);
+    };
+    double otherExtent = 0.0;
+    for (const PlacedInst& in : insts) {
+        if (in.phantom) continue;
+        const double e = (G->opt.dirMode == 1)
+            ? farEdge(in.x, in.bw, G->sheetW, originRight)   // Y: right edge
+            : farEdge(in.y, in.bh, G->sheetH, originTop);    // X: top edge
+        otherExtent = std::max(otherExtent, e);
     }
 
     std::vector<Pt> cand;
@@ -867,6 +891,7 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
                     }
             }
     }
+    if (haveCur) cand.push_back({ curX, curY });   // let the current spot compete
     std::sort(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
         if (a.x != b.x) return a.x < b.x;
         return a.y < b.y; });
@@ -880,7 +905,21 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
         for (const NfpInst& f : nfps)
             if (insideForbidden(f, p, 1e-7)) { bad = true; break; }
         if (bad) continue;
-        double sc = gravityScore(p.x, p.y, x0, y0, x1, y1);
+        // primary: resulting skyline (raise it as little as possible -> notch
+        // filling). secondary: sweep along the cross axis from the origin (fill
+        // each level left->right for X, bottom->top for Y). tertiary: hug the
+        // gravity axis. This is the ArtCAM-like bottom-left-fill behaviour.
+        const double thisFar = (G->opt.dirMode == 1)
+            ? farEdge(p.x, rg.bw, G->sheetW, originRight)
+            : farEdge(p.y, rg.bh, G->sheetH, originTop);
+        const double newSky = std::max(otherExtent, thisFar);
+        const double ux = originRight ? (x1 - p.x) : (p.x - x0);
+        const double uy = originTop   ? (y1 - p.y) : (p.y - y0);
+        const double cross = (G->opt.dirMode == 1) ? uy : ux;   // fill direction
+        const double hug   = (G->opt.dirMode == 1) ? ux : uy;   // toward gravity axis
+        // skyline-fill: raise the pack front as little as possible (fill
+        // notches), then sweep along the cross axis, then hug the gravity axis.
+        double sc = newSky * 1e10 + cross * 1e5 + hug * 10.0 + dirBias;
         if (hasPref && std::fabs(rot - prefRot) < 1e-9) sc -= 1e-3;
         if (sc < out.score) {
             out.ok = true; out.score = sc; out.x = p.x; out.y = p.y; out.rotDeg = rot;
@@ -891,17 +930,15 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
 void considerSheet(const SheetState& sh, long long movKey,
                    const std::vector<double>& rots,
                    bool hasPref, double prefRot, Best& out) {
-    for (int pass = 0; pass < 2; ++pass) {
-        if (pass == 1 && out.ok) break;
-        for (double rot : rots) {
-            const RotGeom& rg = getRotGeom(movKey, rot);
-            const bool matchesDir = (G->opt.dirMode == 1)
-                ? (rg.bh >= rg.bw - 1e-9)
-                : (rg.bw >= rg.bh - 1e-9);
-            if ((pass == 0) != matchesDir) continue;
-            evalFixedRot(sh.insts, movKey, rot, hasPref, prefRot, out);
-        }
-    }
+    // Try EVERY allowed rotation and keep the one that packs tightest (best
+    // gravity score) — i.e. rotate each part by 90 deg (or the allowed step)
+    // to minimise waste, exactly like ArtCAM. The Direction option only sets
+    // the sweep/gravity (X = fill bottom rows, Y = fill left columns), it does
+    // NOT force every part to one orientation (that was the cause of the
+    // scattered top with big gaps). A tiny bias still breaks true ties toward
+    // the Direction so equal-fit parts line up neatly.
+    for (double rot : rots)
+        evalFixedRot(sh.insts, movKey, rot, hasPref, prefRot, out);
 }
 
 // Gravity compaction: repeatedly pull each real part toward the origin corner
@@ -910,9 +947,15 @@ void considerSheet(const SheetState& sh, long long movKey,
 // Uses the same inflated NFP, so the minimum distance stays guaranteed.
 void compactSheet(SheetState& sh) {
     const size_t n = sh.insts.size();
-    if (n < 2 || n > 400) return;
+    if (n < 2 || n > 600) return;
     const double x0 = G->edgePad, y0 = G->edgePad;
-    for (int iter = 0; iter < 2; ++iter) {
+    // Full candidates let a part drop into a notch (valley points between two
+    // neighbours); cheap candidates can't reach notches, leaving the white
+    // gaps you saw. Full compaction is O(n^2) per part so cap it by size to
+    // stay fast; big jobs still compact, just with cheaper candidates.
+    const bool full = (n <= 90);
+    const int maxIter = (n <= 90) ? 5 : 2;
+    for (int iter = 0; iter < maxIter; ++iter) {
         bool moved = false;
         std::vector<size_t> order(n);
         for (size_t i = 0; i < n; ++i) order[i] = i;
@@ -931,14 +974,11 @@ void compactSheet(SheetState& sh) {
             others.reserve(n - 1);
             for (size_t j = 0; j < n; ++j) if (j != i) others.push_back(sh.insts[j]);
             const double rotDeg = sh.insts[i].rotQ / 100.0;
-            const RotGeom& rg = getRotGeom(sh.insts[i].geomKey, rotDeg);
-            const double x1 = G->sheetW - G->edgePad - rg.bw;
-            const double y1 = G->sheetH - G->edgePad - rg.bh;
-            const double cur = gravityScore(sh.insts[i].x, sh.insts[i].y, x0, y0, x1, y1);
-            Best b; b.score = cur - 1e-6;                   // only accept improvement
-            evalFixedRot(others, sh.insts[i].geomKey, rotDeg, false, 0.0, b,
-                         /*fullCandidates*/false);          // cheap polish candidates
-            if (b.ok && b.score < cur - 1e-6) {
+            const double cx = sh.insts[i].x, cy = sh.insts[i].y;
+            Best b;                                        // current spot competes
+            evalFixedRot(others, sh.insts[i].geomKey, rotDeg, false, 0.0, b, full,
+                         /*haveCur*/true, cx, cy);
+            if (b.ok && (std::fabs(b.x - cx) > 1e-6 || std::fabs(b.y - cy) > 1e-6)) {
                 sh.insts[i].x = b.x; sh.insts[i].y = b.y;
                 moved = true;
             }

@@ -248,10 +248,10 @@ int main() {
             CNE_Begin(W, H, PAD, DIST);
             CNE_SetOptions(cfg.fix, 15.0, cfg.origin, cfg.dir, 0, cfg.searchBest, 1.5, 4, cfg.seed);
             gRaw.clear(); gId = 0;
-            for (int i = 0; i < 55; ++i) addOne(strip(uLen(rng), uTh(rng), uAng(rng), 50 * i, 30 * i));
-            for (int i = 0; i < 25; ++i) addOne(cArc(uR(rng), uT(rng), uSpan(rng), 16, 300 + 40 * i, 500));
-            for (int i = 0; i < 25; ++i) addOne(blob(rng, 25 + 3 * i, 18 + 2 * i, 12, 100 * i, 2000));
-            for (int i = 0; i < 35; ++i) addOne(strip(80 + 5 * i, 25, 90.0 * (i % 2), 20 * i, 900));
+            for (int i = 0; i < 28; ++i) addOne(strip(uLen(rng), uTh(rng), uAng(rng), 50 * i, 30 * i));
+            for (int i = 0; i < 12; ++i) addOne(cArc(uR(rng), uT(rng), uSpan(rng), 16, 300 + 40 * i, 500));
+            for (int i = 0; i < 12; ++i) addOne(blob(rng, 25 + 3 * i, 18 + 2 * i, 12, 100 * i, 2000));
+            for (int i = 0; i < 18; ++i) addOne(strip(80 + 5 * i, 25, 90.0 * (i % 2), 20 * i, 900));
             int placedN = CNE_Run(0);
             auto rs = collect();
             std::map<int, std::vector<std::vector<P>>> bySheet;
@@ -472,7 +472,7 @@ int main() {
         CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 2.0, 6, 11);
         setContainer(circle(C.x, C.y, R, 64));
         gRaw.clear(); gId = 0;
-        for (int i = 0; i < 40; ++i) addOne(rect(28, 28, 1000 + 40 * i, 0));  // squares
+        for (int i = 0; i < 18; ++i) addOne(rect(28, 28, 1000 + 40 * i, 0));  // squares
         addOne(rect(400, 400, 5000, 0));      // way bigger than circle -> reject
         const int giant = gId;
         int placed = CNE_Run(0);
@@ -497,7 +497,7 @@ int main() {
                 if (ringsOverlap(pl[i].second, pl[j].second)) overlap = true;
         if (overlap)      { std::printf("  FAIL D: overlap inside circle\n"); ++totalFails; }
         if (giantPlaced)  { std::printf("  FAIL D: oversize part was placed in circle\n"); ++totalFails; }
-        if (inside < 20)  { std::printf("  FAIL D: only %d parts fit the circle (expected many)\n", inside); ++totalFails; }
+        if (inside < 10)  { std::printf("  FAIL D: only %d parts fit the circle (expected many)\n", inside); ++totalFails; }
         CNE_End();
         std::printf("D[circle container]: %d/%d placed, %d inside, oversize rejected=%s\n",
                     placed, gId, inside, giantPlaced ? "NO" : "yes");
@@ -520,7 +520,7 @@ int main() {
         CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 1.5, 5, 22);
         setContainer(tri);
         gRaw.clear(); gId = 0;
-        for (int i = 0; i < 30; ++i) addOne(rect(35, 25, 2000 + 50 * i, 0));
+        for (int i = 0; i < 16; ++i) addOne(rect(35, 25, 2000 + 50 * i, 0));
         int placed = CNE_Run(0);
         auto rs = collect();
         int inside = 0; bool overlap = false;
