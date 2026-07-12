@@ -5,6 +5,7 @@ EXPORTS
     CNE_End
     CNE_SetOptions
     CNE_SetProgressCallback
+    CNE_SetContainer
     CNE_AddPart
     CNE_AddPartEx
     CNE_Run

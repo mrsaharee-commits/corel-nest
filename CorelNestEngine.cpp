@@ -488,6 +488,79 @@ std::vector<std::vector<Pt>> decomposeRegion(const std::vector<std::vector<Pt>>&
     return pieces;
 }
 
+// Vertical slab (trapezoid) decomposition of an even-odd region.
+// Unlike ear-clipping, this ALWAYS tiles the region with NO gaps and NO
+// overlaps — essential for a container's forbidden complement, where a single
+// gap would let a part escape the container. Produces convex quads/triangles.
+std::vector<std::vector<Pt>> vertDecompose(const std::vector<std::vector<Pt>>& ringsIn,
+                                           double eps) {
+    std::vector<std::vector<Pt>> rings;
+    for (auto r : ringsIn) {
+        r = simplifyRing(r, eps);
+        if (r.size() >= 3 && std::fabs(areaOf(r)) > 1e-6) rings.push_back(r);
+    }
+    if (rings.empty()) return {};
+    struct Edge { double x0, y0, x1, y1; };
+    std::vector<Edge> edges;
+    std::vector<double> xs;
+    for (auto& r : rings) {
+        const size_t n = r.size();
+        for (size_t i = 0; i < n; ++i) {
+            const Pt a = r[i], b = r[(i + 1) % n];
+            xs.push_back(a.x);
+            if (std::fabs(a.x - b.x) > 1e-9) edges.push_back({ a.x, a.y, b.x, b.y });
+        }
+    }
+    std::sort(xs.begin(), xs.end());
+    xs.erase(std::unique(xs.begin(), xs.end(),
+             [](double u, double v) { return std::fabs(u - v) < 1e-7; }), xs.end());
+    std::vector<std::vector<Pt>> quads;
+    for (size_t s = 0; s + 1 < xs.size(); ++s) {
+        const double xL = xs[s], xR = xs[s + 1];
+        if (xR - xL < 1e-7) continue;
+        const double xm = 0.5 * (xL + xR);
+        std::vector<std::pair<double, const Edge*>> cr;
+        for (const Edge& e : edges) {
+            const double lo = std::min(e.x0, e.x1), hi = std::max(e.x0, e.x1);
+            if (xm > lo + 1e-12 && xm < hi - 1e-12) {
+                const double t = (xm - e.x0) / (e.x1 - e.x0);
+                cr.push_back({ e.y0 + t * (e.y1 - e.y0), &e });
+            }
+        }
+        std::sort(cr.begin(), cr.end(),
+                  [](const std::pair<double, const Edge*>& a,
+                     const std::pair<double, const Edge*>& b) { return a.first < b.first; });
+        auto yAt = [](const Edge* e, double x) {
+            const double t = (x - e->x0) / (e->x1 - e->x0);
+            return e->y0 + t * (e->y1 - e->y0);
+        };
+        for (size_t k = 0; k + 1 < cr.size(); k += 2) {   // even-odd material spans
+            const Edge* eB = cr[k].second;
+            const Edge* eT = cr[k + 1].second;
+            const double yBL = yAt(eB, xL), yBR = yAt(eB, xR);
+            const double yTL = yAt(eT, xL), yTR = yAt(eT, xR);
+            std::vector<Pt> q = { { xL, yBL }, { xR, yBR }, { xR, yTR }, { xL, yTL } };
+            std::vector<Pt> qc;                            // drop coincident corners
+            for (const Pt& p : q)
+                if (qc.empty() || !samePt(qc.back(), p)) qc.push_back(p);
+            if (qc.size() > 1 && samePt(qc.front(), qc.back())) qc.pop_back();
+            if (qc.size() >= 3 && std::fabs(areaOf(qc)) > 1e-7) {
+                if (areaOf(qc) < 0) std::reverse(qc.begin(), qc.end());
+                quads.push_back(std::move(qc));
+            }
+        }
+    }
+    // triangulate quads and convex-merge -> fewer, larger convex pieces
+    // (cuts the container's piece count, which drives NFP/candidate cost)
+    std::vector<std::array<Pt, 3>> tris;
+    for (const auto& q : quads) {
+        for (size_t i = 1; i + 1 < q.size(); ++i)
+            tris.push_back({ q[0], q[i], q[i + 1] });
+    }
+    std::vector<std::vector<Pt>> merged = hmMerge(tris);
+    return merged.empty() ? quads : merged;
+}
+
 struct NfpPiece { std::vector<Pt> poly; BBox bb; };
 struct NfpInst { std::vector<NfpPiece> pieces; BBox ub; };
 
@@ -579,7 +652,11 @@ struct RotGeom {
     double bw, bh;                         // raw outline bbox at this rotation
 };
 
-struct PlacedInst { long long geomKey; int rotQ; double x, y, bw, bh; };
+struct PlacedInst {
+    long long geomKey; int rotQ; double x, y, bw, bh;
+    bool phantom = false;          // container complement (not a real part)
+    int recIdx = -1;               // back-reference into RunOut::recs
+};
 struct SheetState { std::vector<PlacedInst> insts; };
 
 struct PlaceRec { int partIdx; double x, y, rot; int sheet; bool placed; };
@@ -603,6 +680,11 @@ struct Engine {
     std::mt19937 rng{ 123456789u };
     CNE_ProgressFn progress = nullptr;
     double fitness = 0;
+    // --- container mode (v0.3): nest inside an arbitrary shape -------------
+    long long containerKey = 0;    // geomKey of the container COMPLEMENT
+    double containerPad = 0;       // user's edge padding, applied at the walls
+    double containerOffX = 0;      // maps engine frame -> caller's input frame
+    double containerOffY = 0;
 };
 
 Engine* G = nullptr;
@@ -654,8 +736,12 @@ const RotGeom& getRotGeom(long long key, double rotDeg) {
     RotGeom g;
     g.bw = b.maxx - b.minx; g.bh = b.maxy - b.miny;
 
-    const bool exact = (G->opt.allowInside != 0) && !gd.pieces.empty();
-    const double r = G->minDist * 0.5 + (exact ? gd.simplifyEps : 0.0);
+    const bool isContainer = (key == G->containerKey && G->containerKey != 0);
+    // the container complement ALWAYS uses exact pieces (its hull covers all)
+    const bool exact = (G->opt.allowInside != 0 || isContainer) && !gd.pieces.empty();
+    double r = G->minDist * 0.5 + (exact ? gd.simplifyEps : 0.0);
+    if (isContainer)                       // walls carry the edge padding
+        r += std::max(0.0, G->containerPad - G->minDist * 0.5);
     if (exact) {
         g.piecesI.reserve(gd.pieces.size());
         for (const auto& pc : gd.pieces) {
@@ -692,11 +778,119 @@ const std::vector<std::vector<Pt>>& buildNfp(long long ka, int ra, long long kb,
 
 struct Best { bool ok = false; double x = 0, y = 0, score = 1e300; double rotDeg = 0; };
 
+// gravity score of a legal position (lower is better)
+inline double gravityScore(double px, double py, double x0, double y0,
+                           double x1, double y1) {
+    const bool originRight = (G->opt.originCorner == 1 || G->opt.originCorner == 3);
+    const bool originTop   = (G->opt.originCorner == 2 || G->opt.originCorner == 3);
+    const double ux = originRight ? (x1 - px) : (px - x0);
+    const double uy = originTop   ? (y1 - py) : (py - y0);
+    if (G->opt.dirMode == 1) return ux * 1e7 + uy;     // Y: fill columns
+    return uy * 1e7 + ux;                              // X: fill rows
+}
+
+// Evaluate one fixed rotation of movKey against a set of already-placed insts.
+// Updates `out` if a better-scoring legal position is found. Shared by normal
+// placement and the compaction pass.
+void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
+                  double rot, bool hasPref, double prefRot, Best& out,
+                  bool fullCandidates = true) {
+    const RotGeom& rg = getRotGeom(movKey, rot);
+    const double x0 = G->edgePad, y0 = G->edgePad;
+    const double x1 = G->sheetW - G->edgePad - rg.bw;
+    const double y1 = G->sheetH - G->edgePad - rg.bh;
+    if (x1 < x0 - 1e-9 || y1 < y0 - 1e-9) return;
+    const int rqMov = quantRot(rot);
+
+    std::vector<NfpInst> nfps; nfps.reserve(insts.size());
+    std::vector<char> instIsContainer; instIsContainer.reserve(insts.size());
+    for (const PlacedInst& in : insts) {
+        const auto& base = buildNfp(in.geomKey, in.rotQ, movKey, rqMov);
+        NfpInst f;
+        f.pieces.reserve(base.size());
+        f.ub = BBox{ 1e300, 1e300, -1e300, -1e300 };
+        for (const auto& poly : base) {
+            NfpPiece pc;
+            pc.poly = translatePts(poly, in.x, in.y);
+            pc.bb = bboxOf(pc.poly);
+            f.ub.minx = std::min(f.ub.minx, pc.bb.minx);
+            f.ub.miny = std::min(f.ub.miny, pc.bb.miny);
+            f.ub.maxx = std::max(f.ub.maxx, pc.bb.maxx);
+            f.ub.maxy = std::max(f.ub.maxy, pc.bb.maxy);
+            f.pieces.push_back(std::move(pc));
+        }
+        nfps.push_back(std::move(f));
+        instIsContainer.push_back(in.phantom ? 1 : 0);
+    }
+
+    std::vector<Pt> cand;
+    cand.push_back({ x0, y0 }); cand.push_back({ x1, y0 });
+    cand.push_back({ x0, y1 }); cand.push_back({ x1, y1 });
+    std::vector<const NfpPiece*> allPc;
+    std::vector<int> pcInst;
+    std::vector<int> instCount(nfps.size(), 0);
+    for (size_t fi = 0; fi < nfps.size(); ++fi) {
+        const NfpInst& f = nfps[fi];
+        instCount[fi] = (int)f.pieces.size();
+        for (const NfpPiece& pc : f.pieces) {
+            allPc.push_back(&pc); pcInst.push_back((int)fi);
+            for (const Pt& p : pc.poly) cand.push_back(p);
+            addBorderCrossings(pc.poly, x0, y0, x1, y1, cand);
+        }
+    }
+    // KEY FIX (v0.3): positions where the moving part touches TWO forbidden
+    // boundaries at once = intersections of pairs of piece boundaries. Across
+    // different placed parts (and inside a small concave part's own pieces),
+    // these "valley" points make packing regular — without them a part floats
+    // at a single neighbour's vertex height (the gap you saw in the middle
+    // sheet). Pairs WITHIN one big inst (a container's pre-tiled complement)
+    // are skipped: their facets already share edges, so their intersections
+    // add nothing but cost. bbox-pruned; capped on huge jobs.
+    if (fullCandidates && allPc.size() <= 1200) {
+        for (size_t a = 0; a + 1 < allPc.size(); ++a)
+            for (size_t bidx = a + 1; bidx < allPc.size(); ++bidx) {
+                // skip within-inst pairs only for big NON-container insts; the
+                // container's own wall-corner intersections ARE the interior
+                // candidate positions, so they must be kept.
+                if (pcInst[a] == pcInst[bidx] && instCount[pcInst[a]] > 12 &&
+                    !instIsContainer[pcInst[a]]) continue;
+                const NfpPiece& A = *allPc[a];
+                const NfpPiece& B = *allPc[bidx];
+                if (A.bb.minx > B.bb.maxx + 1e-9 || B.bb.minx > A.bb.maxx + 1e-9 ||
+                    A.bb.miny > B.bb.maxy + 1e-9 || B.bb.miny > A.bb.maxy + 1e-9) continue;
+                for (size_t ei = 0; ei < A.poly.size(); ++ei)
+                    for (size_t ej = 0; ej < B.poly.size(); ++ej) {
+                        Pt ip;
+                        if (segSegPoint(A.poly[ei], A.poly[(ei + 1) % A.poly.size()],
+                                        B.poly[ej], B.poly[(ej + 1) % B.poly.size()], ip))
+                            cand.push_back(ip);
+                    }
+            }
+    }
+    std::sort(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
+        if (a.x != b.x) return a.x < b.x;
+        return a.y < b.y; });
+    cand.erase(std::unique(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
+        return std::fabs(a.x - b.x) < 1e-7 && std::fabs(a.y - b.y) < 1e-7; }), cand.end());
+
+    for (const Pt& p : cand) {
+        if (p.x < x0 - 1e-9 || p.x > x1 + 1e-9 ||
+            p.y < y0 - 1e-9 || p.y > y1 + 1e-9) continue;
+        bool bad = false;
+        for (const NfpInst& f : nfps)
+            if (insideForbidden(f, p, 1e-7)) { bad = true; break; }
+        if (bad) continue;
+        double sc = gravityScore(p.x, p.y, x0, y0, x1, y1);
+        if (hasPref && std::fabs(rot - prefRot) < 1e-9) sc -= 1e-3;
+        if (sc < out.score) {
+            out.ok = true; out.score = sc; out.x = p.x; out.y = p.y; out.rotDeg = rot;
+        }
+    }
+}
+
 void considerSheet(const SheetState& sh, long long movKey,
                    const std::vector<double>& rots,
                    bool hasPref, double prefRot, Best& out) {
-    const bool originRight = (G->opt.originCorner == 1 || G->opt.originCorner == 3);
-    const bool originTop   = (G->opt.originCorner == 2 || G->opt.originCorner == 3);
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1 && out.ok) break;
         for (double rot : rots) {
@@ -705,89 +899,55 @@ void considerSheet(const SheetState& sh, long long movKey,
                 ? (rg.bh >= rg.bw - 1e-9)
                 : (rg.bw >= rg.bh - 1e-9);
             if ((pass == 0) != matchesDir) continue;
-            const double x0 = G->edgePad, y0 = G->edgePad;
-            const double x1 = G->sheetW - G->edgePad - rg.bw;
-            const double y1 = G->sheetH - G->edgePad - rg.bh;
-            if (x1 < x0 - 1e-9 || y1 < y0 - 1e-9) continue;
-            const int rqMov = quantRot(rot);
-
-            std::vector<NfpInst> nfps; nfps.reserve(sh.insts.size());
-            for (const PlacedInst& in : sh.insts) {
-                const auto& base = buildNfp(in.geomKey, in.rotQ, movKey, rqMov);
-                NfpInst f;
-                f.pieces.reserve(base.size());
-                f.ub = BBox{ 1e300, 1e300, -1e300, -1e300 };
-                for (const auto& poly : base) {
-                    NfpPiece pc;
-                    pc.poly = translatePts(poly, in.x, in.y);
-                    pc.bb = bboxOf(pc.poly);
-                    f.ub.minx = std::min(f.ub.minx, pc.bb.minx);
-                    f.ub.miny = std::min(f.ub.miny, pc.bb.miny);
-                    f.ub.maxx = std::max(f.ub.maxx, pc.bb.maxx);
-                    f.ub.maxy = std::max(f.ub.maxy, pc.bb.maxy);
-                    f.pieces.push_back(std::move(pc));
-                }
-                nfps.push_back(std::move(f));
-            }
-
-            std::vector<Pt> cand;
-            cand.push_back({ x0, y0 }); cand.push_back({ x1, y0 });
-            cand.push_back({ x0, y1 }); cand.push_back({ x1, y1 });
-            for (const NfpInst& f : nfps) {
-                for (const NfpPiece& pc : f.pieces) {
-                    for (const Pt& p : pc.poly) cand.push_back(p);
-                    addBorderCrossings(pc.poly, x0, y0, x1, y1, cand);
-                }
-                // POCKET CORNERS: holes/cavities of one part are bounded by
-                // SEVERAL forbidden pieces; the feasible pocket's corners are
-                // intersections of neighbouring piece boundaries. Without
-                // these candidates a part can never enter a fully enclosed
-                // hole. Capped for concave x concave pairs (cost control).
-                const size_t np = f.pieces.size();
-                if (np >= 2 && np <= 48) {
-                    for (size_t a = 0; a + 1 < np; ++a)
-                        for (size_t bidx = a + 1; bidx < np; ++bidx) {
-                            const NfpPiece& A = f.pieces[a];
-                            const NfpPiece& B = f.pieces[bidx];
-                            if (A.bb.minx > B.bb.maxx || B.bb.minx > A.bb.maxx ||
-                                A.bb.miny > B.bb.maxy || B.bb.miny > A.bb.maxy) continue;
-                            for (size_t ei = 0; ei < A.poly.size(); ++ei)
-                                for (size_t ej = 0; ej < B.poly.size(); ++ej) {
-                                    Pt ip;
-                                    if (segSegPoint(A.poly[ei], A.poly[(ei + 1) % A.poly.size()],
-                                                    B.poly[ej], B.poly[(ej + 1) % B.poly.size()], ip))
-                                        cand.push_back(ip);
-                                }
-                        }
-                }
-            }
-            std::sort(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
-                if (a.x != b.x) return a.x < b.x;
-                return a.y < b.y; });
-            cand.erase(std::unique(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
-                return std::fabs(a.x - b.x) < 1e-7 && std::fabs(a.y - b.y) < 1e-7; }), cand.end());
-
-            for (const Pt& p : cand) {
-                if (p.x < x0 - 1e-9 || p.x > x1 + 1e-9 ||
-                    p.y < y0 - 1e-9 || p.y > y1 + 1e-9) continue;
-                bool bad = false;
-                for (const NfpInst& f : nfps)
-                    if (insideForbidden(f, p, 1e-7)) { bad = true; break; }
-                if (bad) continue;
-                const double ux = originRight ? (x1 - p.x) : (p.x - x0);
-                const double uy = originTop   ? (y1 - p.y) : (p.y - y0);
-                double primary, secondary;
-                if (G->opt.dirMode == 1) { primary = ux; secondary = uy; }
-                else                     { primary = uy; secondary = ux; }
-                double sc = primary * 1e7 + secondary;
-                if (hasPref && std::fabs(rot - prefRot) < 1e-9) sc -= 1e-3;
-                if (sc < out.score) {
-                    out.ok = true; out.score = sc; out.x = p.x; out.y = p.y; out.rotDeg = rot;
-                }
-            }
+            evalFixedRot(sh.insts, movKey, rot, hasPref, prefRot, out);
         }
     }
 }
+
+// Gravity compaction: repeatedly pull each real part toward the origin corner
+// (keeping its rotation) into the best legal slot given every other part.
+// Removes leftover gaps and makes the final packing as regular as possible.
+// Uses the same inflated NFP, so the minimum distance stays guaranteed.
+void compactSheet(SheetState& sh) {
+    const size_t n = sh.insts.size();
+    if (n < 2 || n > 400) return;
+    const double x0 = G->edgePad, y0 = G->edgePad;
+    for (int iter = 0; iter < 2; ++iter) {
+        bool moved = false;
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            const RotGeom& ra = getRotGeom(sh.insts[a].geomKey, sh.insts[a].rotQ / 100.0);
+            const RotGeom& rb = getRotGeom(sh.insts[b].geomKey, sh.insts[b].rotQ / 100.0);
+            double sa = gravityScore(sh.insts[a].x, sh.insts[a].y, x0, y0,
+                                     G->sheetW - G->edgePad - ra.bw, G->sheetH - G->edgePad - ra.bh);
+            double sb = gravityScore(sh.insts[b].x, sh.insts[b].y, x0, y0,
+                                     G->sheetW - G->edgePad - rb.bw, G->sheetH - G->edgePad - rb.bh);
+            return sa < sb; });
+        for (size_t oi = 0; oi < n; ++oi) {
+            const size_t i = order[oi];
+            if (sh.insts[i].phantom) continue;             // never move the container
+            std::vector<PlacedInst> others;
+            others.reserve(n - 1);
+            for (size_t j = 0; j < n; ++j) if (j != i) others.push_back(sh.insts[j]);
+            const double rotDeg = sh.insts[i].rotQ / 100.0;
+            const RotGeom& rg = getRotGeom(sh.insts[i].geomKey, rotDeg);
+            const double x1 = G->sheetW - G->edgePad - rg.bw;
+            const double y1 = G->sheetH - G->edgePad - rg.bh;
+            const double cur = gravityScore(sh.insts[i].x, sh.insts[i].y, x0, y0, x1, y1);
+            Best b; b.score = cur - 1e-6;                   // only accept improvement
+            evalFixedRot(others, sh.insts[i].geomKey, rotDeg, false, 0.0, b,
+                         /*fullCandidates*/false);          // cheap polish candidates
+            if (b.ok && b.score < cur - 1e-6) {
+                sh.insts[i].x = b.x; sh.insts[i].y = b.y;
+                moved = true;
+            }
+        }
+        if (!moved) break;
+    }
+}
+
+SheetState makeFreshSheet();          // defined below (needs internGeom helpers)
 
 RunOut runOrder(const std::vector<int>& order,
                 const std::vector<SheetState>& baseSheets, int barrier) {
@@ -804,8 +964,11 @@ RunOut runOrder(const std::vector<int>& order,
             Best b; considerSheet(R.sheets[s], pd.geomKey, rots, hasPref, pr, b);
             if (b.ok) { best = b; bestSheet = (int)s; break; }
         }
-        if (!best.ok) {
-            SheetState fresh;
+        // In container mode there is exactly ONE container; parts that don't
+        // fit are left unplaced rather than spilled onto a phantom sheet.
+        const bool canOpen = (G->containerKey == 0) || R.sheets.empty();
+        if (!best.ok && canOpen) {
+            SheetState fresh = makeFreshSheet();
             Best b; considerSheet(fresh, pd.geomKey, rots, hasPref, pr, b);
             if (b.ok) {
                 R.sheets.push_back(fresh);
@@ -819,6 +982,7 @@ RunOut runOrder(const std::vector<int>& order,
             PlacedInst in;
             in.geomKey = pd.geomKey; in.rotQ = quantRot(best.rotDeg);
             in.x = best.x; in.y = best.y; in.bw = rg.bw; in.bh = rg.bh;
+            in.recIdx = (int)R.recs.size();       // this rec is pushed next
             R.sheets[bestSheet].insts.push_back(in);
             rec.x = best.x; rec.y = best.y; rec.rot = best.rotDeg;
             rec.sheet = bestSheet; rec.placed = true;
@@ -832,18 +996,31 @@ RunOut runOrder(const std::vector<int>& order,
     const int unplaced = (int)order.size() - R.placedCount;
     double sumExt = 0, lastExt = 0; int usedSheets = 0;
     for (const SheetState& sh : R.sheets) {
-        if (sh.insts.empty()) continue;
-        ++usedSheets;
-        double ext = 0;
+        double ext = 0; bool real = false;
         for (const PlacedInst& in : sh.insts) {
+            if (in.phantom) continue;              // ignore the container frame
+            real = true;
             const double e = (G->opt.dirMode == 1) ? (in.x + in.bw - G->edgePad)
                                                    : (in.y + in.bh - G->edgePad);
             ext = std::max(ext, e);
         }
+        if (!real) continue;
+        ++usedSheets;
         sumExt += ext; lastExt = ext;
     }
     R.fitness = 1e12 * unplaced + 1e9 * usedSheets + 1e4 * lastExt + sumExt;
     return R;
+}
+
+// Compact every sheet of a finished layout and sync positions back to recs.
+void compactRun(RunOut& R) {
+    for (SheetState& sh : R.sheets) compactSheet(sh);
+    for (const SheetState& sh : R.sheets)
+        for (const PlacedInst& in : sh.insts)
+            if (!in.phantom && in.recIdx >= 0 && in.recIdx < (int)R.recs.size()) {
+                R.recs[in.recIdx].x = in.x;
+                R.recs[in.recIdx].y = in.y;
+            }
 }
 
 std::vector<int> perturbOrder(const std::vector<int>& base) {
@@ -864,25 +1041,24 @@ std::vector<int> perturbOrder(const std::vector<int>& base) {
     return o;
 }
 
-// shared implementation for both AddPart entry points
-i32 addPartRings(i32 partId, std::vector<std::vector<Pt>> rings) {
-    // normalize: union bbox-min of ALL ring points -> (0,0)
+// Normalize + hash + decompose a ring set, store it, return its geomKey.
+// container=true uses gap-free vertical decomposition (a container's forbidden
+// complement must never leak); parts use ear-clipping (fast, fewer pieces).
+long long internGeom(std::vector<std::vector<Pt>> rings, int maxPieces, bool container) {
     std::vector<Pt> all;
     for (const auto& r : rings) all.insert(all.end(), r.begin(), r.end());
-    if (all.empty()) return -1;
+    if (all.empty()) return 0;
     BBox b = bboxOf(all);
     for (auto& r : rings) r = translatePts(r, -b.minx, -b.miny);
     all = translatePts(all, -b.minx, -b.miny);
-
     for (auto& r : rings) dedupeRing(r);
     const long long key = hashGeom(rings);
-
+    if (key == 0) return 0;
     if (!G->geomStore.count(key)) {
         GeomDef gd;
         gd.rings = rings;
         gd.allPts = all;
         gd.hull = safeHull(all);
-        // material area: |sum of even-depth ring areas| - holes
         double area = 0;
         const size_t nr = rings.size();
         for (size_t i = 0; i < nr; ++i) {
@@ -893,16 +1069,21 @@ i32 addPartRings(i32 partId, std::vector<std::vector<Pt>> rings) {
             area += (depth % 2 == 0) ? a : -a;
         }
         gd.area = std::max(1e-6, area);
-        // decomposition with adaptive simplification
         double eps = 0.15;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            gd.pieces = decomposeRegion(rings, eps, 36);
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            gd.pieces = container ? vertDecompose(rings, eps)
+                                  : decomposeRegion(rings, eps, maxPieces);
             if (!gd.pieces.empty()) { gd.simplifyEps = eps; break; }
             eps *= 2.0;
         }
-        // gd.pieces empty -> hull fallback happens automatically in getRotGeom
         G->geomStore[key] = std::move(gd);
     }
+    return key;
+}
+
+i32 addPartRings(i32 partId, std::vector<std::vector<Pt>> rings) {
+    const long long key = internGeom(std::move(rings), 36, false);
+    if (key == 0) return -1;
     PartDef pd; pd.id = partId; pd.geomKey = key;
     pd.area = G->geomStore[key].area;
     G->parts.push_back(pd);
@@ -912,12 +1093,27 @@ i32 addPartRings(i32 partId, std::vector<std::vector<Pt>> rings) {
     return (i32)G->parts.size() - 1;
 }
 
+// A brand-new sheet, pre-seeded with the container complement (if any) as an
+// immovable phantom so parts can only land inside the container shape.
+SheetState makeFreshSheet() {
+    SheetState s;
+    if (G->containerKey != 0) {
+        const RotGeom& rg = getRotGeom(G->containerKey, 0.0);
+        PlacedInst in;
+        in.geomKey = G->containerKey; in.rotQ = 0;
+        in.x = 0; in.y = 0; in.bw = rg.bw; in.bh = rg.bh;
+        in.phantom = true; in.recIdx = -1;
+        s.insts.push_back(in);
+    }
+    return s;
+}
+
 } // namespace
 
 // ===========================================================================
 // Exported C API
 // ===========================================================================
-CNE_API i32 CNE_CALL CNE_Version(void) { return 103; }
+CNE_API i32 CNE_CALL CNE_Version(void) { return 104; }
 
 CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                double edgePad, double minDist) {
@@ -955,6 +1151,66 @@ CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
 CNE_API i32 CNE_CALL CNE_SetProgressCallback(CNE_ProgressFn fn) {
     if (!G) return 0;
     G->progress = fn;
+    return 1;
+}
+
+// Define an arbitrary container (rectangle, circle, triangle, any outline with
+// optional holes) that parts are nested INSIDE. Passing ringCount < 1 clears
+// the container and returns to plain-sheet nesting.
+//
+// Implementation: the container's COMPLEMENT (a margin rectangle minus the
+// container region) becomes an immovable phantom seeded on every sheet, so the
+// only free space is the container interior. The sheet is resized to the
+// complement's bounding box. Wall clearance = max(edgePad, minDist/2).
+CNE_API i32 CNE_CALL CNE_SetContainer(const double* xy,
+                                      const i32* ringSizes, i32 ringCount) {
+    if (!G) return 0;
+    if (!xy || !ringSizes || ringCount < 1) {          // clear
+        G->containerKey = 0;
+        G->rotCache.clear(); G->nfpCache.clear();
+        return 1;
+    }
+    std::vector<std::vector<Pt>> rings;
+    rings.reserve((size_t)ringCount);
+    long long ofs = 0;
+    BBox bb{ 1e300, 1e300, -1e300, -1e300 };
+    for (i32 r = 0; r < ringCount; ++r) {
+        const i32 nPts = ringSizes[r];
+        if (nPts < 1) return 0;
+        std::vector<Pt> ring; ring.reserve((size_t)nPts);
+        for (i32 i = 0; i < nPts; ++i) {
+            const Pt p{ xy[2 * (ofs + i)], xy[2 * (ofs + i) + 1] };
+            bb.minx = std::min(bb.minx, p.x); bb.miny = std::min(bb.miny, p.y);
+            bb.maxx = std::max(bb.maxx, p.x); bb.maxy = std::max(bb.maxy, p.y);
+            ring.push_back(p);
+        }
+        ofs += nPts;
+        rings.push_back(std::move(ring));
+    }
+    const double cw = bb.maxx - bb.minx, ch = bb.maxy - bb.miny;
+    if (cw < 1.0 || ch < 1.0) return 0;
+    const double M = std::max(G->edgePad, G->minDist) + 20.0;   // outer margin
+
+    // complement = outer rectangle (CCW) with the container rings as holes
+    std::vector<std::vector<Pt>> comp;
+    comp.push_back({ { bb.minx - M, bb.miny - M }, { bb.maxx + M, bb.miny - M },
+                     { bb.maxx + M, bb.maxy + M }, { bb.minx - M, bb.maxy + M } });
+    for (auto& r : rings) comp.push_back(r);
+
+    const long long key = internGeom(std::move(comp), 4096, /*container*/true);
+    if (key == 0) return 0;
+    // a complement that failed to decompose (empty pieces) would fall back to
+    // its hull = the whole rectangle => nothing could be placed. Reject that.
+    if (G->geomStore[key].pieces.empty()) { return 0; }
+
+    G->containerKey = key;
+    G->containerPad = G->edgePad;
+    G->sheetW = cw + 2.0 * M;
+    G->sheetH = ch + 2.0 * M;
+    // engine-frame (complement normalized to bbox-min 0) -> caller's frame
+    G->containerOffX = bb.minx - M;
+    G->containerOffY = bb.miny - M;
+    G->rotCache.clear(); G->nfpCache.clear();
     return 1;
 }
 
@@ -1020,6 +1276,8 @@ CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
         }
     }
 
+    compactRun(best);          // final polish: pull parts tight, kill gaps
+
     G->sheets = best.sheets;
     for (const PlaceRec& rec : best.recs) {
         Engine::Result& rs = G->results[(size_t)rec.partIdx];
@@ -1041,9 +1299,12 @@ CNE_API i32 CNE_CALL CNE_GetPlacement(i32 index, i32* partId,
                                       double* rotDeg, i32* sheetIndex, i32* placed) {
     if (!G || index < 0 || index >= (i32)G->results.size()) return 0;
     const Engine::Result& r = G->results[(size_t)index];
+    // container results map back to the caller's coordinate frame
+    const double offX = (G->containerKey != 0) ? G->containerOffX : 0.0;
+    const double offY = (G->containerKey != 0) ? G->containerOffY : 0.0;
     if (partId)     *partId = r.id;
-    if (leftX)      *leftX = r.x;
-    if (bottomY)    *bottomY = r.y;
+    if (leftX)      *leftX = r.x + (r.placed ? offX : 0.0);
+    if (bottomY)    *bottomY = r.y + (r.placed ? offY : 0.0);
     if (rotDeg)     *rotDeg = r.rot;
     if (sheetIndex) *sheetIndex = r.sheet;
     if (placed)     *placed = r.placed;

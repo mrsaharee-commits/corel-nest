@@ -40,7 +40,7 @@
 typedef int32_t (CNE_CALL *CNE_ProgressFn)(int32_t percent);
 
 // ---- lifecycle -------------------------------------------------------------
-CNE_API int32_t CNE_CALL CNE_Version(void);   // 103 = v0.2.0 (concave core)
+CNE_API int32_t CNE_CALL CNE_Version(void);   // 104 = v0.3.0 (regular packing + containers)
 CNE_API int32_t CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                    double edgePad, double minDist);
 CNE_API int32_t CNE_CALL CNE_End(void);
@@ -63,6 +63,14 @@ CNE_API int32_t CNE_CALL CNE_SetOptions(int32_t fixAngleMode, double rotStepDeg,
                                         double searchTimerSec, int32_t searchCount,
                                         int32_t seed);
 CNE_API int32_t CNE_CALL CNE_SetProgressCallback(CNE_ProgressFn fn);
+
+// Arbitrary container: parts nest INSIDE this outline (rectangle, circle,
+// triangle, any shape, holes allowed). xy/ringSizes/ringCount encode the
+// outline exactly like CNE_AddPartEx, in the SAME coordinate space as the
+// parts. Call with ringCount < 1 to clear and return to plain-sheet nesting.
+// Overrides the sheet size to fit the container. Returns 1 on success.
+CNE_API int32_t CNE_CALL CNE_SetContainer(const double* xy,
+                                          const int32_t* ringSizes, int32_t ringCount);
 
 // ---- parts -----------------------------------------------------------------
 //  Preferred (v0.2): ring-structured outline. xy holds ALL rings back to back

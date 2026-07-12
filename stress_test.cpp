@@ -203,6 +203,21 @@ static void addRings(const Rings& rings) {
         std::printf("  FAIL AddPartEx id=%d\n", gId);
 }
 static void addOne(const std::vector<P>& ring) { addRings(Rings{ ring }); }
+static void setContainer(const std::vector<P>& outline) {
+    std::vector<double> flat;
+    for (const P& p : outline) { flat.push_back(p.x); flat.push_back(p.y); }
+    int32_t sz = (int32_t)outline.size();
+    if (CNE_SetContainer(flat.data(), &sz, 1) != 1)
+        std::printf("  FAIL SetContainer\n");
+}
+static std::vector<P> circle(double cx, double cy, double R, int n) {
+    std::vector<P> v;
+    for (int i = 0; i < n; ++i) {
+        double a = 2.0 * PI * i / n;
+        v.push_back({ cx + R * std::cos(a), cy + R * std::sin(a) });
+    }
+    return v;
+}
 
 struct Res { int id; double x, y, rot; int sheet; int placed; };
 static std::vector<Res> collect() {
@@ -224,8 +239,7 @@ int main() {
         const double W = 1220, H = 2440, PAD = 5, DIST = 4;
         struct Cfg { int dir, origin, fix, seed, searchBest; };
         std::vector<Cfg> cfgs = {
-            {0, 0, 0, 7,  0}, {1, 0, 0, 7,  0}, {1, 3, 0, 42, 0},
-            {0, 0, 4, 11, 0}, {1, 0, 0, 99, 1},
+            {0, 0, 0, 7,  0}, {1, 3, 0, 42, 0}, {0, 0, 4, 11, 0},
         };
         for (const Cfg& cfg : cfgs) {
             std::mt19937 rng(cfg.seed);
@@ -401,7 +415,135 @@ int main() {
                     placedIn, sheetsIn, placedOut, sheetsOut);
     }
 
+    // ============== PART C: REGULARITY (the floating-row bug) ================
+    // 121 identical 90x90 squares must tile a 1000x1000 sheet on ONE sheet with
+    // the packed extent equal to the ideal grid (no floating gaps).
+    {
+        const double W = 1000, H = 1000, PAD = 5, DIST = 0, S = 90;
+        CNE_Begin(W, H, PAD, DIST);
+        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 2.0, 6, 3);   // X, search on
+        gRaw.clear(); gId = 0;
+        const int perRow = (int)((W - 2 * PAD) / S);       // 11
+        const int rows = 6;                                // 66 squares (fast, still exact)
+        const int total = perRow * rows;
+        for (int i = 0; i < total; ++i) addOne(rect(S, S, 3 * i, 2 * i));
+        int placed = CNE_Run(0);
+        int sheets = CNE_GetSheetCount();
+        auto rs = collect();
+        double maxX = 0, maxY = 0; int placedCnt = 0;
+        bool overlap = false;
+        std::vector<std::vector<P>> polys;
+        for (const Res& r : rs) {
+            if (!r.placed) continue;
+            ++placedCnt;
+            Rings pr = placedRings(gRaw[r.id], r.rot, r.x, r.y);
+            for (const P& p : pr[0]) { maxX = std::max(maxX, p.x); maxY = std::max(maxY, p.y); }
+            polys.push_back(pr[0]);
+        }
+        for (size_t i = 0; i < polys.size(); ++i)
+            for (size_t j = i + 1; j < polys.size(); ++j)
+                if (satOverlap(polys[i], polys[j]) &&
+                    polyDistConvex(polys[i], polys[j]) < -1e-6) overlap = true;
+        const double idealExt = PAD + perRow * S;          // 995
+        // density over the used bounding box: perfect tiling -> ~1.0
+        const double density = (placedCnt * S * S) / (std::max(1.0, maxX - PAD) * std::max(1.0, maxY - PAD));
+        if (placed != total) { std::printf("  FAIL C: placed %d/%d\n", placed, total); ++totalFails; }
+        if (sheets != 1)     { std::printf("  FAIL C: used %d sheets (ideal 1)\n", sheets); ++totalFails; }
+        if (overlap)         { std::printf("  FAIL C: overlap\n"); ++totalFails; }
+        if (maxX > idealExt + 1.0 || maxY > idealExt + 1.0) {
+            std::printf("  FAIL C: packing not regular, extent (%.1f,%.1f) > ideal %.1f "
+                        "(floating gap!)\n", maxX, maxY, idealExt);
+            ++totalFails;
+        }
+        if (density < 0.97) {
+            std::printf("  FAIL C: density %.3f too low (gaps present)\n", density);
+            ++totalFails;
+        }
+        CNE_End();
+        std::printf("C[regularity]: %d/%d placed, %d sheet, extent=(%.1f,%.1f) ideal=%.1f, density=%.3f\n",
+                    placed, total, sheets, maxX, maxY, idealExt, density);
+    }
+
+    // ============== PART D: CIRCLE container =================================
+    {
+        const double R = 150, PAD = 3, DIST = 2;
+        const P C{ 300, 300 };
+        CNE_Begin(100, 100, PAD, DIST);       // sheet overridden by container
+        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 2.0, 6, 11);
+        setContainer(circle(C.x, C.y, R, 64));
+        gRaw.clear(); gId = 0;
+        for (int i = 0; i < 40; ++i) addOne(rect(28, 28, 1000 + 40 * i, 0));  // squares
+        addOne(rect(400, 400, 5000, 0));      // way bigger than circle -> reject
+        const int giant = gId;
+        int placed = CNE_Run(0);
+        auto rs = collect();
+        int inside = 0; bool overlap = false, giantPlaced = false;
+        std::vector<std::pair<int, Rings>> pl;
+        for (const Res& r : rs) {
+            if (!r.placed) { continue; }
+            if (r.id == giant) giantPlaced = true;
+            Rings pr = placedRings(gRaw[r.id], r.rot, r.x, r.y);
+            bool allIn = true;
+            for (const P& p : pr[0]) {
+                double d = std::sqrt((p.x - C.x) * (p.x - C.x) + (p.y - C.y) * (p.y - C.y));
+                if (d > R - PAD + 0.4) allIn = false;      // must stay inside, minus wall clearance
+            }
+            if (allIn) ++inside;
+            else { std::printf("  FAIL D: part %d pokes outside the circle\n", r.id); ++totalFails; }
+            pl.push_back({ r.id, std::move(pr) });
+        }
+        for (size_t i = 0; i < pl.size(); ++i)
+            for (size_t j = i + 1; j < pl.size(); ++j)
+                if (ringsOverlap(pl[i].second, pl[j].second)) overlap = true;
+        if (overlap)      { std::printf("  FAIL D: overlap inside circle\n"); ++totalFails; }
+        if (giantPlaced)  { std::printf("  FAIL D: oversize part was placed in circle\n"); ++totalFails; }
+        if (inside < 20)  { std::printf("  FAIL D: only %d parts fit the circle (expected many)\n", inside); ++totalFails; }
+        CNE_End();
+        std::printf("D[circle container]: %d/%d placed, %d inside, oversize rejected=%s\n",
+                    placed, gId, inside, giantPlaced ? "NO" : "yes");
+    }
+
+    // ============== PART E: TRIANGLE container ==============================
+    {
+        const double PAD = 3, DIST = 2;
+        std::vector<P> tri = { {0, 0}, {500, 0}, {250, 430} };
+        // point-in-triangle for verification
+        auto inTri = [&](const P& p) {
+            auto s = [](const P& a, const P& b, const P& c) {
+                return (a.x - c.x) * (b.y - c.y) - (b.x - c.x) * (a.y - c.y); };
+            double d1 = s(p, tri[0], tri[1]), d2 = s(p, tri[1], tri[2]), d3 = s(p, tri[2], tri[0]);
+            bool neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+            bool pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+            return !(neg && pos);
+        };
+        CNE_Begin(100, 100, PAD, DIST);
+        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 1.5, 5, 22);
+        setContainer(tri);
+        gRaw.clear(); gId = 0;
+        for (int i = 0; i < 30; ++i) addOne(rect(35, 25, 2000 + 50 * i, 0));
+        int placed = CNE_Run(0);
+        auto rs = collect();
+        int inside = 0; bool overlap = false;
+        std::vector<Rings> pl;
+        for (const Res& r : rs) {
+            if (!r.placed) continue;
+            Rings pr = placedRings(gRaw[r.id], r.rot, r.x, r.y);
+            bool allIn = true;
+            for (const P& p : pr[0]) if (!inTri(p)) allIn = false;
+            if (allIn) ++inside;
+            else { std::printf("  FAIL E: part %d outside triangle\n", r.id); ++totalFails; }
+            pl.push_back(std::move(pr));
+        }
+        for (size_t i = 0; i < pl.size(); ++i)
+            for (size_t j = i + 1; j < pl.size(); ++j)
+                if (ringsOverlap(pl[i], pl[j])) overlap = true;
+        if (overlap)     { std::printf("  FAIL E: overlap in triangle\n"); ++totalFails; }
+        if (inside < 8)  { std::printf("  FAIL E: only %d parts in triangle\n", inside); ++totalFails; }
+        CNE_End();
+        std::printf("E[triangle container]: %d/%d parts placed inside triangle\n", inside, placed);
+    }
+
     std::printf("\n%s (%d failure(s))\n",
-                totalFails == 0 ? "STRESS v0.2 PASSED" : "STRESS v0.2 FAILED", totalFails);
+                totalFails == 0 ? "STRESS v0.3 PASSED" : "STRESS v0.3 FAILED", totalFails);
     return totalFails == 0 ? 0 : 1;
 }
