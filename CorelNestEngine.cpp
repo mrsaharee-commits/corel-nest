@@ -635,6 +635,7 @@ struct Options {
     i32 allowInside = 0;           // 0 hull-based, 1 exact concave (cavities/holes)
     i32 searchBest = 0; double searchTimerSec = 3.0; i32 searchCount = 4;
     i32 seed = 123456789;
+    i32 optimize = 1;              // 0 = greedy/fast (no compaction), 1 = tidy
 };
 
 struct GeomDef {
@@ -680,6 +681,8 @@ struct Engine {
     std::map<std::array<long long, 4>, std::vector<std::vector<Pt>>> nfpCache;
     std::mt19937 rng{ 123456789u };
     CNE_ProgressFn progress = nullptr;
+    bool aborted = false;          // set when the progress callback returns 0
+    long long tickCounter = 0;     // throttles progress heartbeats
     double fitness = 0;
     // --- container mode (v0.3): nest inside an arbitrary shape -------------
     long long containerKey = 0;    // geomKey of the container COMPLEMENT
@@ -775,6 +778,15 @@ const std::vector<std::vector<Pt>>& buildNfp(long long ka, int ra, long long kb,
             out.push_back(minkowskiConvex(pa, negatePts(pb)));
     auto res = G->nfpCache.emplace(k, std::move(out));
     return res.first->second;
+}
+
+// Fire the progress callback occasionally so the VBA side can keep a LIVE
+// timer ticking (proving the tool is computing, not hung). Throttled by a
+// call counter; sets Engine::aborted if the callback asks to stop (returns 0).
+void heartbeat(int pct) {
+    if (!G->progress) return;
+    if ((G->tickCounter++ % 3) != 0) return;      // ~1 in 3 calls reaches VBA
+    if (G->progress(pct) == 0) G->aborted = true;
 }
 
 struct Best { bool ok = false; double x = 0, y = 0, score = 1e300; double rotDeg = 0; };
@@ -968,6 +980,8 @@ void compactSheet(SheetState& sh) {
                                      G->sheetW - G->edgePad - rb.bw, G->sheetH - G->edgePad - rb.bh);
             return sa < sb; });
         for (size_t oi = 0; oi < n; ++oi) {
+            if (G->aborted) return;
+            heartbeat(99);
             const size_t i = order[oi];
             if (sh.insts[i].phantom) continue;             // never move the container
             std::vector<PlacedInst> others;
@@ -995,7 +1009,11 @@ RunOut runOrder(const std::vector<int>& order,
     R.recs.reserve(order.size());
     std::map<long long, double> prefRot;
     const std::vector<double> rots = rotationList(G->opt);
+    int done = 0;
     for (int idx : order) {
+        if (G->aborted) break;
+        heartbeat((int)std::min(99.0, 100.0 * done / std::max<size_t>(1, order.size())));
+        ++done;
         const PartDef& pd = G->parts[idx];
         const bool hasPref = prefRot.count(pd.geomKey) > 0;
         const double pr = hasPref ? prefRot[pd.geomKey] : 0.0;
@@ -1122,7 +1140,9 @@ long long internGeom(std::vector<std::vector<Pt>> rings, int maxPieces, bool con
 }
 
 i32 addPartRings(i32 partId, std::vector<std::vector<Pt>> rings) {
-    const long long key = internGeom(std::move(rings), 36, false);
+    // higher piece cap so Allow-inside decomposition survives many-vertex parts
+    // (circles/donuts) instead of falling back to the solid convex hull
+    const long long key = internGeom(std::move(rings), 120, false);
     if (key == 0) return -1;
     PartDef pd; pd.id = partId; pd.geomKey = key;
     pd.area = G->geomStore[key].area;
@@ -1153,7 +1173,7 @@ SheetState makeFreshSheet() {
 // ===========================================================================
 // Exported C API
 // ===========================================================================
-CNE_API i32 CNE_CALL CNE_Version(void) { return 104; }
+CNE_API i32 CNE_CALL CNE_Version(void) { return 105; }
 
 CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                double edgePad, double minDist) {
@@ -1171,7 +1191,7 @@ CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
                                     i32 originCorner, i32 dirMode,
                                     i32 allowInside, i32 searchBest,
                                     double searchTimerSec, i32 searchCount,
-                                    i32 seed) {
+                                    i32 seed, i32 optimize) {
     if (!G) return 0;
     G->opt.fixAngleMode = fixAngleMode;
     G->opt.rotStepDeg = rotStepDeg;
@@ -1182,6 +1202,7 @@ CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
     G->opt.searchTimerSec = searchTimerSec;
     G->opt.searchCount = searchCount;
     G->opt.seed = seed;
+    G->opt.optimize = optimize;
     G->rng.seed((unsigned)seed);
     G->rotCache.clear();          // mode-dependent caches
     G->nfpCache.clear();
@@ -1297,26 +1318,28 @@ CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
     std::stable_sort(base.begin(), base.end(), [](int a, int b) {
         return G->parts[a].area > G->parts[b].area; });
 
+    G->aborted = false;
     const auto t0 = std::chrono::steady_clock::now();
     RunOut best = runOrder(base, G->sheets, barrier);
 
-    if (G->opt.searchBest) {
+    if (G->opt.searchBest && !G->aborted) {
         const int attempts = std::max(1, (int)G->opt.searchCount);
         const double budget = std::max(0.25, G->opt.searchTimerSec);
         for (int k = 1; k < attempts; ++k) {
             const double el = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
-            if (el > budget) break;
+            if (el > budget || G->aborted) break;
             RunOut r = runOrder(perturbOrder(base), G->sheets, barrier);
             if (r.fitness < best.fitness) best = r;
             if (G->progress) {
                 const double frac = std::max((double)k / attempts, el / budget);
-                if (G->progress((i32)std::min(99.0, frac * 100.0)) == 0) break;
+                if (G->progress((i32)std::min(99.0, frac * 100.0)) == 0) { G->aborted = true; break; }
             }
         }
     }
 
-    compactRun(best);          // final polish: pull parts tight, kill gaps
+    if (G->opt.optimize && !G->aborted)
+        compactRun(best);      // "tidy" quality: pull parts tight, kill gaps
 
     G->sheets = best.sheets;
     for (const PlaceRec& rec : best.recs) {

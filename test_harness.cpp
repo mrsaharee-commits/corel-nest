@@ -105,7 +105,7 @@ int main() {
 
     if (!CNE_Begin(W, H, PAD, DIST)) { std::printf("FAIL: Begin\n"); return 1; }
     CNE_SetOptions(/*fixAngle*/0, /*step*/15.0, /*origin LB*/0, /*fit Bottom*/0,
-                   /*allowInside*/0, /*searchBest*/1, /*timer*/2.0, /*count*/6, /*seed*/42);
+                   /*allowInside*/0, /*searchBest*/1, /*timer*/2.0, /*count*/6, /*seed*/42, /*optimize*/1);
     std::printf("engine version: %d\n", CNE_Version());
 
     std::map<int, std::vector<P>> raw;   // id -> raw points (for verification)

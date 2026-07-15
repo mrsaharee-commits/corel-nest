@@ -40,7 +40,7 @@
 typedef int32_t (CNE_CALL *CNE_ProgressFn)(int32_t percent);
 
 // ---- lifecycle -------------------------------------------------------------
-CNE_API int32_t CNE_CALL CNE_Version(void);   // 104 = v0.3.0 (regular packing + containers)
+CNE_API int32_t CNE_CALL CNE_Version(void);   // 105 = v0.4.0 (quality modes + live progress)
 CNE_API int32_t CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                    double edgePad, double minDist);
 CNE_API int32_t CNE_CALL CNE_End(void);
@@ -57,11 +57,13 @@ CNE_API int32_t CNE_CALL CNE_End(void);
 //                     cavities or holes of other parts)
 //                 1 = EXACT concave forbidden regions via convex decomposition:
 //                     parts nest inside C/U cavities and inside holes
+//  optimize     : 0 = greedy/fast (skip the tidy compaction pass)
+//                 1 = tidy (run compaction to remove gaps; a little slower)
 CNE_API int32_t CNE_CALL CNE_SetOptions(int32_t fixAngleMode, double rotStepDeg,
                                         int32_t originCorner, int32_t dirMode,
                                         int32_t allowInside, int32_t searchBest,
                                         double searchTimerSec, int32_t searchCount,
-                                        int32_t seed);
+                                        int32_t seed, int32_t optimize);
 CNE_API int32_t CNE_CALL CNE_SetProgressCallback(CNE_ProgressFn fn);
 
 // Arbitrary container: parts nest INSIDE this outline (rectangle, circle,
