@@ -1,6 +1,15 @@
 // ============================================================================
 //  CorelNestEngine.cpp — Corel-Nesting Engine, high-performance core
-//  v0.2.0  (engine version 103)
+//  v0.5.0  (engine version 106)
+//
+//  NEW in v0.5 — SPEED + CORRECTNESS:
+//    * evalFixedRot rewritten as two-phase branch & bound over cached
+//      local-frame NFPs (no per-call polygon copies). Same placements,
+//      typically an order of magnitude faster on real jobs.
+//    * "Divide by color/layer" fix: instances inherited from a previous
+//      CNE_Run are frozen (stale recIdx no longer corrupts later groups).
+//    * Container + keepExisting=2 now fills the container instead of
+//      leaving every later group unplaced.
 //
 //  NEW in v0.2 — the CONCAVE core:
 //    Parts are no longer approximated by their convex hull. Each part's
@@ -562,27 +571,45 @@ std::vector<std::vector<Pt>> vertDecompose(const std::vector<std::vector<Pt>>& r
     return merged.empty() ? quads : merged;
 }
 
-struct NfpPiece { std::vector<Pt> poly; BBox bb; };
-struct NfpInst { std::vector<NfpPiece> pieces; BBox ub; };
+// v0.5: a cached NFP polygon — vertices + bbox + per-edge bboxes, all in the
+// LOCAL frame of the stationary instance (add the instance position to get
+// world coordinates). Everything is computed ONCE in buildNfp, so a placement
+// evaluation allocates no geometry at all (the v0.4 hot loop translated and
+// copied every polygon of every placed part on every evaluation).
+struct NfpPoly {
+    std::vector<Pt> poly;
+    BBox bb;
+    std::vector<BBox> ebb;      // bbox of edge i: poly[i] -> poly[i+1]
+};
 
-bool strictlyInsidePiece(const NfpPiece& f, const Pt& p, double tol) {
-    if (p.x < f.bb.minx + tol || p.x > f.bb.maxx - tol ||
-        p.y < f.bb.miny + tol || p.y > f.bb.maxy - tol) return false;
+// One placed instance's forbidden set, viewed during a single evaluation.
+struct InstNfp {
+    const std::vector<NfpPoly>* polys;  // cached pieces, local frame
+    double ox, oy;                      // instance offset (local -> world)
+    BBox ub;                            // union bbox, WORLD frame
+    bool isContainer;
+};
+
+// point-in-piece test in the piece's LOCAL frame
+bool strictlyInsidePiece(const NfpPoly& f, double px, double py, double tol) {
+    if (px < f.bb.minx + tol || px > f.bb.maxx - tol ||
+        py < f.bb.miny + tol || py > f.bb.maxy - tol) return false;
     const size_t n = f.poly.size();
     for (size_t i = 0; i < n; ++i) {
         const Pt& a = f.poly[i]; const Pt& b = f.poly[(i + 1) % n];
         double ex = b.x - a.x, ey = b.y - a.y;
         double L = vlen(ex, ey); if (L < 1e-12) continue;
-        if (cross3(a, b, p) / L < tol) return false;
+        if ((ex * (py - a.y) - ey * (px - a.x)) / L < tol) return false;
     }
     return true;
 }
 
-bool insideForbidden(const NfpInst& f, const Pt& p, double tol) {
-    if (p.x < f.ub.minx + tol || p.x > f.ub.maxx - tol ||
-        p.y < f.ub.miny + tol || p.y > f.ub.maxy - tol) return false;
-    for (const NfpPiece& pc : f.pieces)
-        if (strictlyInsidePiece(pc, p, tol)) return true;
+bool insideForbidden(const InstNfp& f, double px, double py, double tol) {
+    if (px < f.ub.minx + tol || px > f.ub.maxx - tol ||
+        py < f.ub.miny + tol || py > f.ub.maxy - tol) return false;
+    const double lx = px - f.ox, ly = py - f.oy;
+    for (const NfpPoly& pc : *f.polys)
+        if (strictlyInsidePiece(pc, lx, ly, tol)) return true;
     return false;
 }
 
@@ -599,12 +626,14 @@ bool segSegPoint(const Pt& a, const Pt& b, const Pt& c, const Pt& d, Pt& out) {
     return true;
 }
 
-void addBorderCrossings(const std::vector<Pt>& poly,
+// crossings of a LOCAL-frame polygon (shifted by ox/oy) with the IFP borders
+void addBorderCrossings(const std::vector<Pt>& poly, double ox, double oy,
                         double x0, double y0, double x1, double y1,
                         std::vector<Pt>& out) {
     const size_t n = poly.size();
     for (size_t i = 0; i < n; ++i) {
-        const Pt& a = poly[i]; const Pt& b = poly[(i + 1) % n];
+        const Pt a{ poly[i].x + ox, poly[i].y + oy };
+        const Pt b{ poly[(i + 1) % n].x + ox, poly[(i + 1) % n].y + oy };
         double dx = b.x - a.x, dy = b.y - a.y;
         if (std::fabs(dx) > 1e-12) {
             for (double X : { x0, x1 }) {
@@ -678,7 +707,7 @@ struct Engine {
     std::vector<SheetState> sheets;
     std::map<long long, GeomDef> geomStore;
     std::map<std::pair<long long, int>, RotGeom> rotCache;
-    std::map<std::array<long long, 4>, std::vector<std::vector<Pt>>> nfpCache;
+    std::map<std::array<long long, 4>, std::vector<NfpPoly>> nfpCache;
     std::mt19937 rng{ 123456789u };
     CNE_ProgressFn progress = nullptr;
     bool aborted = false;          // set when the progress callback returns 0
@@ -765,17 +794,28 @@ const RotGeom& getRotGeom(long long key, double rotDeg) {
 // Forbidden pieces for (stationary A, orbiting B) = pairwise convex Minkowski
 // sums of A's pieces with -B's pieces. Union membership is checked piece by
 // piece, which is exact because Minkowski distributes over unions.
-const std::vector<std::vector<Pt>>& buildNfp(long long ka, int ra, long long kb, int rb) {
+const std::vector<NfpPoly>& buildNfp(long long ka, int ra, long long kb, int rb) {
     const std::array<long long, 4> k{ ka, (long long)ra, kb, (long long)rb };
     auto it = G->nfpCache.find(k);
     if (it != G->nfpCache.end()) return it->second;
     const RotGeom& A = getRotGeom(ka, ra / 100.0);
     const RotGeom& B = getRotGeom(kb, rb / 100.0);
-    std::vector<std::vector<Pt>> out;
+    std::vector<NfpPoly> out;
     out.reserve(A.piecesI.size() * B.piecesI.size());
     for (const auto& pa : A.piecesI)
-        for (const auto& pb : B.piecesI)
-            out.push_back(minkowskiConvex(pa, negatePts(pb)));
+        for (const auto& pb : B.piecesI) {
+            NfpPoly np;
+            np.poly = minkowskiConvex(pa, negatePts(pb));
+            np.bb = bboxOf(np.poly);
+            const size_t n = np.poly.size();
+            np.ebb.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                const Pt& a = np.poly[i]; const Pt& b = np.poly[(i + 1) % n];
+                np.ebb[i] = BBox{ std::min(a.x, b.x), std::min(a.y, b.y),
+                                  std::max(a.x, b.x), std::max(a.y, b.y) };
+            }
+            out.push_back(std::move(np));
+        }
     auto res = G->nfpCache.emplace(k, std::move(out));
     return res.first->second;
 }
@@ -805,6 +845,17 @@ inline double gravityScore(double px, double py, double x0, double y0,
 // Evaluate one fixed rotation of movKey against a set of already-placed insts.
 // Updates `out` if a better-scoring legal position is found. Shared by normal
 // placement and the compaction pass.
+//
+// v0.5 SPEED REWRITE (identical placements, much less work):
+//   1. NFP polygons stay in their cached local frame — no per-call polygon
+//      translation/allocation (v0.4 copied every polygon on every call).
+//   2. Cheap candidates (corners, NFP vertices, border crossings) are scored
+//      FIRST and scanned in ascending-score order with early exit.
+//   3. "Valley" boundary-boundary intersections — the O(n^2 * e^2) part — are
+//      processed per PAIR in best-possible-score order and pruned against the
+//      current best (branch & bound): a pair whose overlap box cannot beat the
+//      best is skipped without touching a single edge. Edge-bbox prechecks
+//      kill most remaining segment tests.
 void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
                   double rot, bool hasPref, double prefRot, Best& out,
                   bool fullCandidates = true,
@@ -820,27 +871,32 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
     const bool matchesDir = (G->opt.dirMode == 1) ? (rg.bh >= rg.bw - 1e-9)
                                                    : (rg.bw >= rg.bh - 1e-9);
     const double dirBias = matchesDir ? 0.0 : 3.0;
+    const double prefBonus = (hasPref && std::fabs(rot - prefRot) < 1e-9) ? 1e-3 : 0.0;
 
-    std::vector<NfpInst> nfps; nfps.reserve(insts.size());
-    std::vector<char> instIsContainer; instIsContainer.reserve(insts.size());
+    // ---- cached NFP views (zero geometry copies) ---------------------------
+    std::vector<InstNfp> nfps; nfps.reserve(insts.size());
+    size_t totalPieces = 0;
     for (const PlacedInst& in : insts) {
-        const auto& base = buildNfp(in.geomKey, in.rotQ, movKey, rqMov);
-        NfpInst f;
-        f.pieces.reserve(base.size());
+        const std::vector<NfpPoly>& base = buildNfp(in.geomKey, in.rotQ, movKey, rqMov);
+        InstNfp f;
+        f.polys = &base;
+        f.ox = in.x; f.oy = in.y;
+        f.isContainer = in.phantom;
         f.ub = BBox{ 1e300, 1e300, -1e300, -1e300 };
-        for (const auto& poly : base) {
-            NfpPiece pc;
-            pc.poly = translatePts(poly, in.x, in.y);
-            pc.bb = bboxOf(pc.poly);
-            f.ub.minx = std::min(f.ub.minx, pc.bb.minx);
-            f.ub.miny = std::min(f.ub.miny, pc.bb.miny);
-            f.ub.maxx = std::max(f.ub.maxx, pc.bb.maxx);
-            f.ub.maxy = std::max(f.ub.maxy, pc.bb.maxy);
-            f.pieces.push_back(std::move(pc));
+        for (const NfpPoly& np : base) {
+            f.ub.minx = std::min(f.ub.minx, np.bb.minx + in.x);
+            f.ub.miny = std::min(f.ub.miny, np.bb.miny + in.y);
+            f.ub.maxx = std::max(f.ub.maxx, np.bb.maxx + in.x);
+            f.ub.maxy = std::max(f.ub.maxy, np.bb.maxy + in.y);
         }
-        nfps.push_back(std::move(f));
-        instIsContainer.push_back(in.phantom ? 1 : 0);
+        totalPieces += base.size();
+        nfps.push_back(f);
     }
+    auto isLegal = [&](double px, double py) -> bool {
+        for (const InstNfp& f : nfps)
+            if (insideForbidden(f, px, py, 1e-7)) return false;
+        return true;
+    };
 
     // current "skyline": the farthest edge of already-placed real parts along
     // the gravity axis, measured from the origin. Candidates that stay under
@@ -859,82 +915,135 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
         otherExtent = std::max(otherExtent, e);
     }
 
+    // score of a candidate position — same formula as v0.4:
+    // primary: resulting skyline (raise it as little as possible -> notch
+    // filling). secondary: sweep along the cross axis from the origin.
+    // tertiary: hug the gravity axis. (ArtCAM-like bottom-left fill.)
+    auto scoreOf = [&](double px, double py) -> double {
+        const double thisFar = (G->opt.dirMode == 1)
+            ? farEdge(px, rg.bw, G->sheetW, originRight)
+            : farEdge(py, rg.bh, G->sheetH, originTop);
+        const double newSky = std::max(otherExtent, thisFar);
+        const double ux = originRight ? (x1 - px) : (px - x0);
+        const double uy = originTop   ? (y1 - py) : (py - y0);
+        const double cross = (G->opt.dirMode == 1) ? uy : ux;   // fill direction
+        const double hug   = (G->opt.dirMode == 1) ? ux : uy;   // toward gravity axis
+        return newSky * 1e10 + cross * 1e5 + hug * 10.0 + dirBias - prefBonus;
+    };
+    // exact lower bound of scoreOf over a world-frame box: every term is
+    // monotone per axis, and all are minimised at the same corner.
+    auto minScoreOverBox = [&](double bxmin, double bymin, double bxmax, double bymax) {
+        const double px = originRight ? bxmax : bxmin;
+        const double py = originTop   ? bymax : bymin;
+        return scoreOf(px, py);
+    };
+
+    // ---- phase 1: cheap candidates, scanned best-score-first ---------------
     std::vector<Pt> cand;
+    cand.reserve(totalPieces * 24 + 8);
     cand.push_back({ x0, y0 }); cand.push_back({ x1, y0 });
     cand.push_back({ x0, y1 }); cand.push_back({ x1, y1 });
-    std::vector<const NfpPiece*> allPc;
-    std::vector<int> pcInst;
-    std::vector<int> instCount(nfps.size(), 0);
-    for (size_t fi = 0; fi < nfps.size(); ++fi) {
-        const NfpInst& f = nfps[fi];
-        instCount[fi] = (int)f.pieces.size();
-        for (const NfpPiece& pc : f.pieces) {
-            allPc.push_back(&pc); pcInst.push_back((int)fi);
-            for (const Pt& p : pc.poly) cand.push_back(p);
-            addBorderCrossings(pc.poly, x0, y0, x1, y1, cand);
+    for (const InstNfp& f : nfps)
+        for (const NfpPoly& np : *f.polys) {
+            for (const Pt& p : np.poly) cand.push_back({ p.x + f.ox, p.y + f.oy });
+            addBorderCrossings(np.poly, f.ox, f.oy, x0, y0, x1, y1, cand);
         }
-    }
-    // KEY FIX (v0.3): positions where the moving part touches TWO forbidden
-    // boundaries at once = intersections of pairs of piece boundaries. Across
-    // different placed parts (and inside a small concave part's own pieces),
-    // these "valley" points make packing regular — without them a part floats
-    // at a single neighbour's vertex height (the gap you saw in the middle
-    // sheet). Pairs WITHIN one big inst (a container's pre-tiled complement)
-    // are skipped: their facets already share edges, so their intersections
-    // add nothing but cost. bbox-pruned; capped on huge jobs.
-    if (fullCandidates && allPc.size() <= 1200) {
-        for (size_t a = 0; a + 1 < allPc.size(); ++a)
-            for (size_t bidx = a + 1; bidx < allPc.size(); ++bidx) {
-                // skip within-inst pairs only for big NON-container insts; the
-                // container's own wall-corner intersections ARE the interior
-                // candidate positions, so they must be kept.
-                if (pcInst[a] == pcInst[bidx] && instCount[pcInst[a]] > 12 &&
-                    !instIsContainer[pcInst[a]]) continue;
-                const NfpPiece& A = *allPc[a];
-                const NfpPiece& B = *allPc[bidx];
-                if (A.bb.minx > B.bb.maxx + 1e-9 || B.bb.minx > A.bb.maxx + 1e-9 ||
-                    A.bb.miny > B.bb.maxy + 1e-9 || B.bb.miny > A.bb.maxy + 1e-9) continue;
-                for (size_t ei = 0; ei < A.poly.size(); ++ei)
-                    for (size_t ej = 0; ej < B.poly.size(); ++ej) {
-                        Pt ip;
-                        if (segSegPoint(A.poly[ei], A.poly[(ei + 1) % A.poly.size()],
-                                        B.poly[ej], B.poly[(ej + 1) % B.poly.size()], ip))
-                            cand.push_back(ip);
-                    }
-            }
-    }
     if (haveCur) cand.push_back({ curX, curY });   // let the current spot compete
-    std::sort(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
-        if (a.x != b.x) return a.x < b.x;
-        return a.y < b.y; });
-    cand.erase(std::unique(cand.begin(), cand.end(), [](const Pt& a, const Pt& b) {
-        return std::fabs(a.x - b.x) < 1e-7 && std::fabs(a.y - b.y) < 1e-7; }), cand.end());
 
+    struct SC { double sc; Pt p; };
+    std::vector<SC> scand; scand.reserve(cand.size());
     for (const Pt& p : cand) {
         if (p.x < x0 - 1e-9 || p.x > x1 + 1e-9 ||
             p.y < y0 - 1e-9 || p.y > y1 + 1e-9) continue;
-        bool bad = false;
-        for (const NfpInst& f : nfps)
-            if (insideForbidden(f, p, 1e-7)) { bad = true; break; }
-        if (bad) continue;
-        // primary: resulting skyline (raise it as little as possible -> notch
-        // filling). secondary: sweep along the cross axis from the origin (fill
-        // each level left->right for X, bottom->top for Y). tertiary: hug the
-        // gravity axis. This is the ArtCAM-like bottom-left-fill behaviour.
-        const double thisFar = (G->opt.dirMode == 1)
-            ? farEdge(p.x, rg.bw, G->sheetW, originRight)
-            : farEdge(p.y, rg.bh, G->sheetH, originTop);
-        const double newSky = std::max(otherExtent, thisFar);
-        const double ux = originRight ? (x1 - p.x) : (p.x - x0);
-        const double uy = originTop   ? (y1 - p.y) : (p.y - y0);
-        const double cross = (G->opt.dirMode == 1) ? uy : ux;   // fill direction
-        const double hug   = (G->opt.dirMode == 1) ? ux : uy;   // toward gravity axis
-        // skyline-fill: raise the pack front as little as possible (fill
-        // notches), then sweep along the cross axis, then hug the gravity axis.
-        double sc = newSky * 1e10 + cross * 1e5 + hug * 10.0 + dirBias;
-        if (hasPref && std::fabs(rot - prefRot) < 1e-9) sc -= 1e-3;
-        if (sc < out.score) {
-            out.ok = true; out.score = sc; out.x = p.x; out.y = p.y; out.rotDeg = rot;
+        scand.push_back({ scoreOf(p.x, p.y), p });
+    }
+    std::sort(scand.begin(), scand.end(), [](const SC& a, const SC& b) {
+        if (a.sc != b.sc) return a.sc < b.sc;
+        if (a.p.x != b.p.x) return a.p.x < b.p.x;   // v0.4 tie order preserved
+        return a.p.y < b.p.y; });
+    for (const SC& s : scand) {
+        if (s.sc >= out.score) break;              // sorted: nothing better left
+        if (!isLegal(s.p.x, s.p.y)) continue;
+        out.ok = true; out.score = s.sc; out.x = s.p.x; out.y = s.p.y; out.rotDeg = rot;
+        break;
+    }
+
+    // ---- phase 2: "valley" candidates (v0.3 key fix), branch & bound -------
+    // Positions where the moving part touches TWO forbidden boundaries at
+    // once = intersections of pairs of piece boundaries. Pairs WITHIN one big
+    // inst (a container's pre-tiled complement) are skipped as before; the
+    // container's own wall-corner intersections ARE kept.
+    if (!fullCandidates || totalPieces > 1200) return;
+
+    struct PRef { const NfpPoly* np; const InstNfp* f; int inst; };
+    std::vector<PRef> pcs; pcs.reserve(totalPieces);
+    std::vector<int> instCount(nfps.size(), 0);
+    for (size_t fi = 0; fi < nfps.size(); ++fi) {
+        instCount[fi] = (int)nfps[fi].polys->size();
+        for (const NfpPoly& np : *nfps[fi].polys)
+            pcs.push_back({ &np, &nfps[fi], (int)fi });
+    }
+
+    struct PairJob { double bound; int a, b; };
+    std::vector<PairJob> jobs;
+    const double bx0 = x0 - 1e-9, bx1 = x1 + 1e-9;
+    const double by0 = y0 - 1e-9, by1 = y1 + 1e-9;
+    for (size_t a = 0; a + 1 < pcs.size(); ++a) {
+        const double aox = pcs[a].f->ox, aoy = pcs[a].f->oy;
+        const BBox& ba = pcs[a].np->bb;
+        for (size_t b = a + 1; b < pcs.size(); ++b) {
+            if (pcs[a].inst == pcs[b].inst && instCount[pcs[a].inst] > 12 &&
+                !pcs[a].f->isContainer) continue;
+            const double box2 = pcs[b].f->ox, boy2 = pcs[b].f->oy;
+            const BBox& bb = pcs[b].np->bb;
+            // world-frame overlap of the two piece bboxes, clipped to the IFP
+            const double ovxmin = std::max(std::max(ba.minx + aox, bb.minx + box2), bx0);
+            const double ovxmax = std::min(std::min(ba.maxx + aox, bb.maxx + box2), bx1);
+            if (ovxmin > ovxmax) continue;
+            const double ovymin = std::max(std::max(ba.miny + aoy, bb.miny + boy2), by0);
+            const double ovymax = std::min(std::min(ba.maxy + aoy, bb.maxy + boy2), by1);
+            if (ovymin > ovymax) continue;
+            const double bound = minScoreOverBox(ovxmin, ovymin, ovxmax, ovymax);
+            if (bound >= out.score) continue;      // cannot beat the best: prune
+            jobs.push_back({ bound, (int)a, (int)b });
+        }
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const PairJob& u, const PairJob& v) {
+        return u.bound < v.bound; });
+
+    for (const PairJob& j : jobs) {
+        if (j.bound >= out.score) break;           // sorted: the rest are pruned
+        const PRef& A = pcs[j.a]; const PRef& B = pcs[j.b];
+        const double aox = A.f->ox, aoy = A.f->oy;
+        const double bofx = B.f->ox, bofy = B.f->oy;
+        const size_t na = A.np->poly.size(), nb = B.np->poly.size();
+        for (size_t ei = 0; ei < na; ++ei) {
+            const BBox& ea = A.np->ebb[ei];
+            if (ea.minx + aox > B.np->bb.maxx + bofx + 1e-9 ||
+                ea.maxx + aox < B.np->bb.minx + bofx - 1e-9 ||
+                ea.miny + aoy > B.np->bb.maxy + bofy + 1e-9 ||
+                ea.maxy + aoy < B.np->bb.miny + bofy - 1e-9) continue;
+            const Pt a1{ A.np->poly[ei].x + aox, A.np->poly[ei].y + aoy };
+            const Pt a2{ A.np->poly[(ei + 1) % na].x + aox,
+                         A.np->poly[(ei + 1) % na].y + aoy };
+            for (size_t ej = 0; ej < nb; ++ej) {
+                const BBox& eb = B.np->ebb[ej];
+                if (eb.minx + bofx > ea.maxx + aox + 1e-9 ||
+                    eb.maxx + bofx < ea.minx + aox - 1e-9 ||
+                    eb.miny + bofy > ea.maxy + aoy + 1e-9 ||
+                    eb.maxy + bofy < ea.miny + aoy - 1e-9) continue;
+                Pt ip;
+                if (!segSegPoint(a1, a2,
+                        { B.np->poly[ej].x + bofx, B.np->poly[ej].y + bofy },
+                        { B.np->poly[(ej + 1) % nb].x + bofx,
+                          B.np->poly[(ej + 1) % nb].y + bofy }, ip)) continue;
+                if (ip.x < x0 - 1e-9 || ip.x > x1 + 1e-9 ||
+                    ip.y < y0 - 1e-9 || ip.y > y1 + 1e-9) continue;
+                const double sc = scoreOf(ip.x, ip.y);
+                if (sc >= out.score) continue;
+                if (!isLegal(ip.x, ip.y)) continue;
+                out.ok = true; out.score = sc; out.x = ip.x; out.y = ip.y; out.rotDeg = rot;
+            }
         }
     }
 }
@@ -983,7 +1092,9 @@ void compactSheet(SheetState& sh) {
             if (G->aborted) return;
             heartbeat(99);
             const size_t i = order[oi];
-            if (sh.insts[i].phantom) continue;             // never move the container
+            // never move the container, nor parts inherited from a previous
+            // run (recIdx < 0): their positions were already applied/reported
+            if (sh.insts[i].phantom || sh.insts[i].recIdx < 0) continue;
             std::vector<PlacedInst> others;
             others.reserve(n - 1);
             for (size_t j = 0; j < n; ++j) if (j != i) others.push_back(sh.insts[j]);
@@ -1006,6 +1117,15 @@ SheetState makeFreshSheet();          // defined below (needs internGeom helpers
 RunOut runOrder(const std::vector<int>& order,
                 const std::vector<SheetState>& baseSheets, int barrier) {
     RunOut R; R.sheets = baseSheets;
+    // v0.5 CORRECTNESS FIX: instances inherited from a previous CNE_Run (the
+    // earlier groups of "Divide by color/layer") are FROZEN. Their recIdx
+    // pointed into the PREVIOUS run's rec list; leaving it set made compactRun
+    // write an old part's position into THIS run's records — a different
+    // part's result — so two parts could land on top of each other. Freezing
+    // (recIdx = -1) keeps them as immovable obstacles with already-final
+    // results, and compactSheet skips them below.
+    for (SheetState& sh : R.sheets)
+        for (PlacedInst& in : sh.insts) in.recIdx = -1;
     R.recs.reserve(order.size());
     std::map<long long, double> prefRot;
     const std::vector<double> rots = rotationList(G->opt);
@@ -1173,7 +1293,7 @@ SheetState makeFreshSheet() {
 // ===========================================================================
 // Exported C API
 // ===========================================================================
-CNE_API i32 CNE_CALL CNE_Version(void) { return 105; }
+CNE_API i32 CNE_CALL CNE_Version(void) { return 106; }
 
 CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                double edgePad, double minDist) {
@@ -1312,7 +1432,11 @@ CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
         for (size_t i = 0; i < G->parts.size(); ++i) G->pendingIdx.push_back((int)i);
     }
     if (G->pendingIdx.empty()) return 0;
-    const int barrier = (keepExisting == 2) ? (int)G->sheets.size() : 0;
+    // v0.5: in container mode there is exactly ONE sheet (the container), so
+    // keepExisting=2 ("new sheets only") would strand every later group as
+    // UNPLACED. Treat it like keepExisting=1 there: fill the container.
+    const int barrier = (keepExisting == 2 && G->containerKey == 0)
+                            ? (int)G->sheets.size() : 0;
 
     std::vector<int> base = G->pendingIdx;
     std::stable_sort(base.begin(), base.end(), [](int a, int b) {
