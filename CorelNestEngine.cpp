@@ -49,6 +49,8 @@
 #include <chrono>
 #include <random>
 #include <cstdlib>
+#include <thread>
+#include <atomic>
 
 namespace {
 
@@ -171,10 +173,12 @@ std::vector<Pt> minkowskiConvex(std::vector<Pt> P, std::vector<Pt> Q) {
 
 // Outward inflation of a convex CCW polygon by r; result always CONTAINS the
 // exact disk offset (miter for small turns, circumscribed arcs for sharp ones).
-std::vector<Pt> offsetConvex(const std::vector<Pt>& v, double r) {
+// maxStep controls arc coarseness: coarser arcs stay SAFE (circumscribed =
+// always >= r) and cut the vertex count, which drives every downstream cost.
+std::vector<Pt> offsetConvex(const std::vector<Pt>& v, double r,
+                             double maxStep = PI / 6.0) {
     if (r <= 1e-12 || v.size() < 3) return v;
     const size_t n = v.size();
-    const double maxStep = PI / 6.0;
     std::vector<Pt> out; out.reserve(n * 4);
     for (size_t i = 0; i < n; ++i) {
         const Pt& prev = v[(i + n - 1) % n];
@@ -713,6 +717,11 @@ struct Engine {
     bool aborted = false;          // set when the progress callback returns 0
     long long tickCounter = 0;     // throttles progress heartbeats
     double fitness = 0;
+    // v0.6: soft deadline for the final compaction polish (search mode only) -
+    // keeps the TOTAL run close to the user's Search timer budget instead of
+    // silently tripling it.
+    bool hasDeadline = false;
+    std::chrono::steady_clock::time_point deadline;
     // --- container mode (v0.3): nest inside an arbitrary shape -------------
     long long containerKey = 0;    // geomKey of the container COMPLEMENT
     double containerPad = 0;       // user's edge padding, applied at the walls
@@ -776,11 +785,15 @@ const RotGeom& getRotGeom(long long key, double rotDeg) {
     if (isContainer)                       // walls carry the edge padding
         r += std::max(0.0, G->containerPad - G->minDist * 0.5);
     if (exact) {
+        // v0.6: coarser (still circumscribed = safe) arcs for part pieces.
+        // Letters decompose into many small pieces; PI/4 arcs shave ~40% of
+        // the NFP vertices at a sub-quarter-millimetre outward bulge.
+        const double arcStep = isContainer ? (PI / 6.0) : (PI / 4.0);
         g.piecesI.reserve(gd.pieces.size());
         for (const auto& pc : gd.pieces) {
             std::vector<Pt> rp = safeHull(rotatePts(pc, rotDeg));
             rp = translatePts(rp, -b.minx, -b.miny);
-            g.piecesI.push_back(r > 1e-12 ? safeHull(offsetConvex(rp, r)) : rp);
+            g.piecesI.push_back(r > 1e-12 ? safeHull(offsetConvex(rp, r, arcStep)) : rp);
         }
     } else {
         std::vector<Pt> rp = safeHull(rotatePts(gd.hull, rotDeg));
@@ -820,13 +833,40 @@ const std::vector<NfpPoly>& buildNfp(long long ka, int ra, long long kb, int rb)
     return res.first->second;
 }
 
+// ---------------------------------------------------------------------------
+// v0.6 async run state. CNE_RunAsync executes the nest on a WORKER thread so
+// the CorelDRAW UI thread stays free (the VBA side polls CNE_RunStatus with
+// DoEvents - Corel remains usable while the engine computes). The worker only
+// touches G; the VBA side must not call mutating APIs while a run is active
+// (they are guarded below).
+// ---------------------------------------------------------------------------
+std::thread gWorker;
+std::atomic<int>  gAsyncState{ 0 };    // 0 idle, 1 running, 2 finished
+std::atomic<int>  gAsyncResult{ -1 };
+std::atomic<int>  gAsyncPct{ 0 };
+std::atomic<bool> gAsyncAbort{ false };
+
+void joinWorker() {
+    if (gWorker.joinable()) gWorker.join();
+}
+
 // Fire the progress callback occasionally so the VBA side can keep a LIVE
 // timer ticking (proving the tool is computing, not hung). Throttled by a
 // call counter; sets Engine::aborted if the callback asks to stop (returns 0).
+// In async mode there is NO cross-thread VBA callback (COM apartments forbid
+// it) - progress is published to an atomic that VBA polls instead.
 void heartbeat(int pct) {
-    if (!G->progress) return;
+    gAsyncPct.store(pct, std::memory_order_relaxed);
+    if (gAsyncAbort.load(std::memory_order_relaxed)) G->aborted = true;
+    if (!G->progress) { ++G->tickCounter; return; }
     if ((G->tickCounter++ % 3) != 0) return;      // ~1 in 3 calls reaches VBA
     if (G->progress(pct) == 0) G->aborted = true;
+}
+
+// true when the soft deadline (search mode) has passed - used to stop the
+// OPTIONAL compaction polish; never aborts the mandatory placement pass
+bool pastDeadline() {
+    return G->hasDeadline && std::chrono::steady_clock::now() > G->deadline;
 }
 
 struct Best { bool ok = false; double x = 0, y = 0, score = 1e300; double rotDeg = 0; };
@@ -973,76 +1013,129 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
     // once = intersections of pairs of piece boundaries. Pairs WITHIN one big
     // inst (a container's pre-tiled complement) are skipped as before; the
     // container's own wall-corner intersections ARE kept.
-    if (!fullCandidates || totalPieces > 1200) return;
+    //
+    // v0.6 ADAPTIVE generation: every piece gets its own best-possible-score
+    // bound (its clipped bbox corner nearest the packing origin). Pieces are
+    // sorted by that bound, and since a pair's bound can never beat either
+    // member's own bound, the double loop breaks out as soon as bounds reach
+    // the current best. After phase 1 seeds a good best, only pieces near the
+    // packing frontier survive - so letter jobs with tens of thousands of NFP
+    // pieces stay fast (the old code simply gave up above 1200 pieces, which
+    // silently DISABLED notch-filling for letters).
+    if (!fullCandidates) return;
 
-    struct PRef { const NfpPoly* np; const InstNfp* f; int inst; };
-    std::vector<PRef> pcs; pcs.reserve(totalPieces);
+    struct PB {
+        double bound;
+        double cx0, cy0, cx1, cy1;      // world bbox clipped to the IFP
+        const NfpPoly* np; const InstNfp* f; int inst;
+    };
+    std::vector<PB> pbs; pbs.reserve(totalPieces);
     std::vector<int> instCount(nfps.size(), 0);
-    for (size_t fi = 0; fi < nfps.size(); ++fi) {
-        instCount[fi] = (int)nfps[fi].polys->size();
-        for (const NfpPoly& np : *nfps[fi].polys)
-            pcs.push_back({ &np, &nfps[fi], (int)fi });
-    }
-
-    struct PairJob { double bound; int a, b; };
-    std::vector<PairJob> jobs;
     const double bx0 = x0 - 1e-9, bx1 = x1 + 1e-9;
     const double by0 = y0 - 1e-9, by1 = y1 + 1e-9;
-    for (size_t a = 0; a + 1 < pcs.size(); ++a) {
-        const double aox = pcs[a].f->ox, aoy = pcs[a].f->oy;
-        const BBox& ba = pcs[a].np->bb;
-        for (size_t b = a + 1; b < pcs.size(); ++b) {
-            if (pcs[a].inst == pcs[b].inst && instCount[pcs[a].inst] > 12 &&
-                !pcs[a].f->isContainer) continue;
-            const double box2 = pcs[b].f->ox, boy2 = pcs[b].f->oy;
-            const BBox& bb = pcs[b].np->bb;
-            // world-frame overlap of the two piece bboxes, clipped to the IFP
-            const double ovxmin = std::max(std::max(ba.minx + aox, bb.minx + box2), bx0);
-            const double ovxmax = std::min(std::min(ba.maxx + aox, bb.maxx + box2), bx1);
+    for (size_t fi = 0; fi < nfps.size(); ++fi) {
+        instCount[fi] = (int)nfps[fi].polys->size();
+        const InstNfp& f = nfps[fi];
+        for (const NfpPoly& np : *f.polys) {
+            PB pb;
+            pb.cx0 = std::max(np.bb.minx + f.ox, bx0);
+            pb.cx1 = std::min(np.bb.maxx + f.ox, bx1);
+            if (pb.cx0 > pb.cx1) continue;          // never reaches the IFP
+            pb.cy0 = std::max(np.bb.miny + f.oy, by0);
+            pb.cy1 = std::min(np.bb.maxy + f.oy, by1);
+            if (pb.cy0 > pb.cy1) continue;
+            pb.bound = minScoreOverBox(pb.cx0, pb.cy0, pb.cx1, pb.cy1);
+            if (pb.bound >= out.score) continue;    // already hopeless
+            pb.np = &np; pb.f = &f; pb.inst = (int)fi;
+            pbs.push_back(pb);
+        }
+    }
+    std::sort(pbs.begin(), pbs.end(), [](const PB& u, const PB& v) {
+        return u.bound < v.bound; });
+    // keep only the best-bounded pieces: dense letter jobs produce thousands
+    // of NFP pieces whose bbox bounds barely prune (big overlapping boxes).
+    // The frontier region - where a better candidate can live - is covered by
+    // the best-bounded few hundred; the tail is the least promising by
+    // construction, so truncating it is the optimal way to cap the O(K^2)
+    // pair enumeration below.
+    const size_t PIECE_CAP = 256;
+    const bool dense = pbs.size() > PIECE_CAP;      // letters-style job
+    if (dense) pbs.resize(PIECE_CAP);
+
+    // collect pair jobs, then process them in GLOBAL best-bound order: the
+    // best pairs tighten out.score early, which prunes everything behind them
+    struct PairJob { double bound; int a, b; };
+    std::vector<PairJob> jobs;
+    jobs.reserve(256);
+    for (size_t a = 0; a + 1 < pbs.size(); ++a) {
+        if (pbs[a].bound >= out.score) break;       // sorted: rest are pruned
+        const PB& A = pbs[a];
+        for (size_t b = a + 1; b < pbs.size(); ++b) {
+            const PB& B = pbs[b];
+            if (B.bound >= out.score) break;        // sorted: inner rest pruned
+            if (A.inst == B.inst && instCount[A.inst] > 12 &&
+                !A.f->isContainer) continue;
+            const double ovxmin = std::max(A.cx0, B.cx0);
+            const double ovxmax = std::min(A.cx1, B.cx1);
             if (ovxmin > ovxmax) continue;
-            const double ovymin = std::max(std::max(ba.miny + aoy, bb.miny + boy2), by0);
-            const double ovymax = std::min(std::min(ba.maxy + aoy, bb.maxy + boy2), by1);
+            const double ovymin = std::max(A.cy0, B.cy0);
+            const double ovymax = std::min(A.cy1, B.cy1);
             if (ovymin > ovymax) continue;
             const double bound = minScoreOverBox(ovxmin, ovymin, ovxmax, ovymax);
-            if (bound >= out.score) continue;      // cannot beat the best: prune
+            if (bound >= out.score) continue;       // pair cannot beat the best
             jobs.push_back({ bound, (int)a, (int)b });
         }
     }
     std::sort(jobs.begin(), jobs.end(), [](const PairJob& u, const PairJob& v) {
         return u.bound < v.bound; });
 
+    // ANYTIME budget - applied ONLY to dense (letters-style) jobs, where the
+    // big overlapping NFP boxes make the bounds loose: with pairs in
+    // best-first order the budget spends itself on the most promising valleys
+    // and drops only the least promising tail. Regular jobs never feel a cap,
+    // so their placements stay EXACTLY as the exhaustive algorithm computes.
+    // When phase 1 found no legal spot the bound cannot prune, so the budget
+    // also caps the "does not fit on this sheet" proof on dense jobs.
+    long long segBudget = dense ? (out.ok ? 250000 : 300000) : (1LL << 62);
+
     for (const PairJob& j : jobs) {
-        if (j.bound >= out.score) break;           // sorted: the rest are pruned
-        const PRef& A = pcs[j.a]; const PRef& B = pcs[j.b];
+        if (j.bound >= out.score) break;            // sorted: rest are pruned
+        if (segBudget <= 0) break;                  // work budget spent
+        const PB& A = pbs[(size_t)j.a];
+        const PB& B = pbs[(size_t)j.b];
         const double aox = A.f->ox, aoy = A.f->oy;
-        const double bofx = B.f->ox, bofy = B.f->oy;
-        const size_t na = A.np->poly.size(), nb = B.np->poly.size();
-        for (size_t ei = 0; ei < na; ++ei) {
-            const BBox& ea = A.np->ebb[ei];
-            if (ea.minx + aox > B.np->bb.maxx + bofx + 1e-9 ||
-                ea.maxx + aox < B.np->bb.minx + bofx - 1e-9 ||
-                ea.miny + aoy > B.np->bb.maxy + bofy + 1e-9 ||
-                ea.maxy + aoy < B.np->bb.miny + bofy - 1e-9) continue;
-            const Pt a1{ A.np->poly[ei].x + aox, A.np->poly[ei].y + aoy };
-            const Pt a2{ A.np->poly[(ei + 1) % na].x + aox,
-                         A.np->poly[(ei + 1) % na].y + aoy };
-            for (size_t ej = 0; ej < nb; ++ej) {
-                const BBox& eb = B.np->ebb[ej];
-                if (eb.minx + bofx > ea.maxx + aox + 1e-9 ||
-                    eb.maxx + bofx < ea.minx + aox - 1e-9 ||
-                    eb.miny + bofy > ea.maxy + aoy + 1e-9 ||
-                    eb.maxy + bofy < ea.miny + aoy - 1e-9) continue;
-                Pt ip;
-                if (!segSegPoint(a1, a2,
-                        { B.np->poly[ej].x + bofx, B.np->poly[ej].y + bofy },
-                        { B.np->poly[(ej + 1) % nb].x + bofx,
-                          B.np->poly[(ej + 1) % nb].y + bofy }, ip)) continue;
-                if (ip.x < x0 - 1e-9 || ip.x > x1 + 1e-9 ||
-                    ip.y < y0 - 1e-9 || ip.y > y1 + 1e-9) continue;
-                const double sc = scoreOf(ip.x, ip.y);
-                if (sc >= out.score) continue;
-                if (!isLegal(ip.x, ip.y)) continue;
-                out.ok = true; out.score = sc; out.x = ip.x; out.y = ip.y; out.rotDeg = rot;
+        const size_t na = A.np->poly.size();
+        {
+            const double bofx = B.f->ox, bofy = B.f->oy;
+            const size_t nb = B.np->poly.size();
+            segBudget -= (long long)(na * nb);
+            for (size_t ei = 0; ei < na; ++ei) {
+                const BBox& ea = A.np->ebb[ei];
+                if (ea.minx + aox > B.np->bb.maxx + bofx + 1e-9 ||
+                    ea.maxx + aox < B.np->bb.minx + bofx - 1e-9 ||
+                    ea.miny + aoy > B.np->bb.maxy + bofy + 1e-9 ||
+                    ea.maxy + aoy < B.np->bb.miny + bofy - 1e-9) continue;
+                const Pt a1{ A.np->poly[ei].x + aox, A.np->poly[ei].y + aoy };
+                const Pt a2{ A.np->poly[(ei + 1) % na].x + aox,
+                             A.np->poly[(ei + 1) % na].y + aoy };
+                for (size_t ej = 0; ej < nb; ++ej) {
+                    const BBox& eb = B.np->ebb[ej];
+                    if (eb.minx + bofx > ea.maxx + aox + 1e-9 ||
+                        eb.maxx + bofx < ea.minx + aox - 1e-9 ||
+                        eb.miny + bofy > ea.maxy + aoy + 1e-9 ||
+                        eb.maxy + bofy < ea.miny + aoy - 1e-9) continue;
+                    Pt ip;
+                    if (!segSegPoint(a1, a2,
+                            { B.np->poly[ej].x + bofx, B.np->poly[ej].y + bofy },
+                            { B.np->poly[(ej + 1) % nb].x + bofx,
+                              B.np->poly[(ej + 1) % nb].y + bofy }, ip)) continue;
+                    if (ip.x < x0 - 1e-9 || ip.x > x1 + 1e-9 ||
+                        ip.y < y0 - 1e-9 || ip.y > y1 + 1e-9) continue;
+                    const double sc = scoreOf(ip.x, ip.y);
+                    if (sc >= out.score) continue;
+                    if (!isLegal(ip.x, ip.y)) continue;
+                    out.ok = true; out.score = sc; out.x = ip.x; out.y = ip.y; out.rotDeg = rot;
+                }
             }
         }
     }
@@ -1077,6 +1170,7 @@ void compactSheet(SheetState& sh) {
     const bool full = (n <= 90);
     const int maxIter = (n <= 90) ? 5 : 2;
     for (int iter = 0; iter < maxIter; ++iter) {
+        if (pastDeadline()) return;        // polish is optional - budget is not
         bool moved = false;
         std::vector<size_t> order(n);
         for (size_t i = 0; i < n; ++i) order[i] = i;
@@ -1089,7 +1183,7 @@ void compactSheet(SheetState& sh) {
                                      G->sheetW - G->edgePad - rb.bw, G->sheetH - G->edgePad - rb.bh);
             return sa < sb; });
         for (size_t oi = 0; oi < n; ++oi) {
-            if (G->aborted) return;
+            if (G->aborted || pastDeadline()) return;
             heartbeat(99);
             const size_t i = order[oi];
             // never move the container, nor parts inherited from a previous
@@ -1247,13 +1341,33 @@ long long internGeom(std::vector<std::vector<Pt>> rings, int maxPieces, bool con
             area += (depth % 2 == 0) ? a : -a;
         }
         gd.area = std::max(1e-6, area);
+        // v0.6 PIECE BUDGET: the placement cost is quadratic in the number of
+        // convex pieces (NFP count = piecesA x piecesB), so complex letterforms
+        // must not decompose into dozens of slivers. The simplification eps is
+        // escalated until the part fits the budget; the minimum-distance
+        // guarantee is untouched because eps is added to the inflation radius.
+        // eps stays proportional to the part size so small diacritics keep
+        // their shape.
+        BBox pb = bboxOf(all);
+        const double epsCap = container ? 0.15
+            : std::min(2.0, std::max(0.15, 0.02 * std::max(pb.maxx - pb.minx,
+                                                           pb.maxy - pb.miny)));
+        const int pieceBudget = 16;
         double eps = 0.15;
-        for (int attempt = 0; attempt < 4; ++attempt) {
-            gd.pieces = container ? vertDecompose(rings, eps)
-                                  : decomposeRegion(rings, eps, maxPieces);
-            if (!gd.pieces.empty()) { gd.simplifyEps = eps; break; }
+        std::vector<std::vector<Pt>> lastGood;
+        double lastEps = 0.15;
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            std::vector<std::vector<Pt>> ps =
+                container ? vertDecompose(rings, eps)
+                          : decomposeRegion(rings, eps, maxPieces);
+            if (!ps.empty()) { lastGood = std::move(ps); lastEps = eps; }
+            if (!lastGood.empty() &&
+                (container || (int)lastGood.size() <= pieceBudget)) break;
+            if (eps * 2.0 > epsCap && !lastGood.empty()) break;
             eps *= 2.0;
         }
+        gd.pieces = std::move(lastGood);
+        gd.simplifyEps = gd.pieces.empty() ? 0.0 : lastEps;
         G->geomStore[key] = std::move(gd);
     }
     return key;
@@ -1293,11 +1407,14 @@ SheetState makeFreshSheet() {
 // ===========================================================================
 // Exported C API
 // ===========================================================================
-CNE_API i32 CNE_CALL CNE_Version(void) { return 106; }
+CNE_API i32 CNE_CALL CNE_Version(void) { return 107; }
 
 CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                double edgePad, double minDist) {
     if (sheetW <= 1.0 || sheetH <= 1.0) return 0;
+    if (gAsyncState.load() == 1) { gAsyncAbort.store(true); }
+    joinWorker();
+    gAsyncState.store(0);
     delete G; G = new Engine();
     G->sheetW = sheetW; G->sheetH = sheetH;
     G->edgePad = std::max(0.0, edgePad);
@@ -1305,14 +1422,20 @@ CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
     return 1;
 }
 
-CNE_API i32 CNE_CALL CNE_End(void) { delete G; G = nullptr; return 1; }
+CNE_API i32 CNE_CALL CNE_End(void) {
+    if (gAsyncState.load() == 1) { gAsyncAbort.store(true); }
+    joinWorker();
+    gAsyncState.store(0);
+    delete G; G = nullptr;
+    return 1;
+}
 
 CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
                                     i32 originCorner, i32 dirMode,
                                     i32 allowInside, i32 searchBest,
                                     double searchTimerSec, i32 searchCount,
                                     i32 seed, i32 optimize) {
-    if (!G) return 0;
+    if (!G || gAsyncState.load() == 1) return 0;
     G->opt.fixAngleMode = fixAngleMode;
     G->opt.rotStepDeg = rotStepDeg;
     G->opt.originCorner = originCorner;
@@ -1345,7 +1468,7 @@ CNE_API i32 CNE_CALL CNE_SetProgressCallback(CNE_ProgressFn fn) {
 // complement's bounding box. Wall clearance = max(edgePad, minDist/2).
 CNE_API i32 CNE_CALL CNE_SetContainer(const double* xy,
                                       const i32* ringSizes, i32 ringCount) {
-    if (!G) return 0;
+    if (!G || gAsyncState.load() == 1) return 0;
     if (!xy || !ringSizes || ringCount < 1) {          // clear
         G->containerKey = 0;
         G->rotCache.clear(); G->nfpCache.clear();
@@ -1400,6 +1523,7 @@ CNE_API i32 CNE_CALL CNE_SetContainer(const double* xy,
 CNE_API i32 CNE_CALL CNE_AddPartEx(i32 partId, const double* xy,
                                    const i32* ringSizes, i32 ringCount) {
     if (!G || !xy || !ringSizes || ringCount < 1) return -1;
+    if (gAsyncState.load() == 1) return -1;
     std::vector<std::vector<Pt>> rings;
     rings.reserve((size_t)ringCount);
     long long ofs = 0;
@@ -1418,13 +1542,16 @@ CNE_API i32 CNE_CALL CNE_AddPartEx(i32 partId, const double* xy,
 // Legacy single-cloud input (v0.1) — kept for compatibility.
 CNE_API i32 CNE_CALL CNE_AddPart(i32 partId, const double* xy, i32 nPoints) {
     if (!G || !xy || nPoints < 1) return -1;
+    if (gAsyncState.load() == 1) return -1;
     std::vector<Pt> pts; pts.reserve((size_t)nPoints);
     for (i32 i = 0; i < nPoints; ++i) pts.push_back({ xy[2 * i], xy[2 * i + 1] });
     std::vector<std::vector<Pt>> rings; rings.push_back(std::move(pts));
     return addPartRings(partId, std::move(rings));
 }
 
-CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
+namespace {
+// The actual solve - shared by the blocking CNE_Run and the async worker.
+i32 runImpl(i32 keepExisting) {
     if (!G) return -1;
     if (keepExisting == 0) {
         G->sheets.clear();
@@ -1443,12 +1570,19 @@ CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
         return G->parts[a].area > G->parts[b].area; });
 
     G->aborted = false;
+    G->hasDeadline = false;
     const auto t0 = std::chrono::steady_clock::now();
     RunOut best = runOrder(base, G->sheets, barrier);
 
     if (G->opt.searchBest && !G->aborted) {
         const int attempts = std::max(1, (int)G->opt.searchCount);
         const double budget = std::max(0.25, G->opt.searchTimerSec);
+        // the compaction polish must respect the same budget: leave it ~35%
+        // of the timer beyond the search, then stop wherever it got to
+        G->deadline = t0 + std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(budget * 1.35 + 1.0));
+        G->hasDeadline = true;
         for (int k = 1; k < attempts; ++k) {
             const double el = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -1465,6 +1599,7 @@ CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
     if (G->opt.optimize && !G->aborted)
         compactRun(best);      // "tidy" quality: pull parts tight, kill gaps
 
+    G->hasDeadline = false;
     G->sheets = best.sheets;
     for (const PlaceRec& rec : best.recs) {
         Engine::Result& rs = G->results[(size_t)rec.partIdx];
@@ -1474,7 +1609,61 @@ CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
     G->fitness = best.fitness;
     G->pendingIdx.clear();
     if (G->progress) G->progress(100);
+    gAsyncPct.store(100, std::memory_order_relaxed);
     return best.placedCount;
+}
+} // namespace
+
+CNE_API i32 CNE_CALL CNE_Run(i32 keepExisting) {
+    if (gAsyncState.load() == 1) return -1;        // a worker is already running
+    joinWorker();
+    return runImpl(keepExisting);
+}
+
+// ---------------------------------------------------------------------------
+// v0.6 ASYNC API - run the nest on a worker thread so CorelDRAW stays usable.
+//   CNE_RunAsync(keep)  -> 1 started, 0 refused (no engine / already running)
+//   CNE_RunStatus()     -> -2 while running; afterwards the CNE_Run result
+//                          (joins the worker); -3 if nothing was started
+//   CNE_GetAsyncPct()   -> live progress 0..100 for the polling UI
+//   CNE_AbortRun()      -> ask the worker to stop at the next heartbeat
+// The caller must not invoke mutating APIs (Begin/End/AddPart/SetOptions/
+// SetContainer/Run) while CNE_RunStatus() returns -2.
+// ---------------------------------------------------------------------------
+CNE_API i32 CNE_CALL CNE_RunAsync(i32 keepExisting) {
+    if (!G) return 0;
+    if (gAsyncState.load() == 1) return 0;
+    joinWorker();
+    gAsyncAbort.store(false);
+    gAsyncPct.store(0);
+    gAsyncResult.store(-1);
+    gAsyncState.store(1);
+    gWorker = std::thread([keepExisting]() {
+        const i32 r = runImpl(keepExisting);
+        gAsyncResult.store(r);
+        gAsyncState.store(2);
+    });
+    return 1;
+}
+
+CNE_API i32 CNE_CALL CNE_RunStatus(void) {
+    const int st = gAsyncState.load();
+    if (st == 1) return -2;
+    if (st == 2) {
+        joinWorker();
+        gAsyncState.store(0);
+        return gAsyncResult.load();
+    }
+    return -3;
+}
+
+CNE_API i32 CNE_CALL CNE_GetAsyncPct(void) {
+    return gAsyncPct.load(std::memory_order_relaxed);
+}
+
+CNE_API i32 CNE_CALL CNE_AbortRun(void) {
+    gAsyncAbort.store(true);
+    return 1;
 }
 
 CNE_API i32 CNE_CALL CNE_GetPlacementCount(void) {

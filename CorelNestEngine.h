@@ -40,7 +40,7 @@
 typedef int32_t (CNE_CALL *CNE_ProgressFn)(int32_t percent);
 
 // ---- lifecycle -------------------------------------------------------------
-CNE_API int32_t CNE_CALL CNE_Version(void);   // 106 = v0.5.0 (B&B fast placement + divide-groups fix)
+CNE_API int32_t CNE_CALL CNE_Version(void);   // 107 = v0.6.0 (async runs + letters fast path)
 CNE_API int32_t CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                    double edgePad, double minDist);
 CNE_API int32_t CNE_CALL CNE_End(void);
@@ -90,6 +90,20 @@ CNE_API int32_t CNE_CALL CNE_AddPart(int32_t partId, const double* xy, int32_t n
 //                 2 = keep current placements, pending parts only on NEW sheets
 //  Returns number of parts placed in this run, -1 on error.
 CNE_API int32_t CNE_CALL CNE_Run(int32_t keepExisting);
+
+// ---- v0.6 async solve (keeps the CorelDRAW UI thread free) -----------------
+//  CNE_RunAsync : start the same solve on a worker thread.
+//                 Returns 1 = started, 0 = refused (no engine / already running).
+//  CNE_RunStatus: -2 while running; afterwards the CNE_Run result (joins the
+//                 worker); -3 if nothing was started.
+//  CNE_GetAsyncPct : live progress 0..100 for a polling UI.
+//  CNE_AbortRun    : ask the worker to stop at its next heartbeat.
+//  While CNE_RunStatus() == -2 every mutating call (Begin/End/AddPart/
+//  SetOptions/SetContainer/Run) is refused; CNE_Begin/CNE_End abort+join first.
+CNE_API int32_t CNE_CALL CNE_RunAsync(int32_t keepExisting);
+CNE_API int32_t CNE_CALL CNE_RunStatus(void);
+CNE_API int32_t CNE_CALL CNE_GetAsyncPct(void);
+CNE_API int32_t CNE_CALL CNE_AbortRun(void);
 
 // ---- results ---------------------------------------------------------------
 CNE_API int32_t CNE_CALL CNE_GetPlacementCount(void);

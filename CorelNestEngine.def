@@ -9,6 +9,10 @@ EXPORTS
     CNE_AddPart
     CNE_AddPartEx
     CNE_Run
+    CNE_RunAsync
+    CNE_RunStatus
+    CNE_GetAsyncPct
+    CNE_AbortRun
     CNE_GetPlacementCount
     CNE_GetPlacement
     CNE_GetSheetCount
