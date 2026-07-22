@@ -225,7 +225,7 @@ static std::vector<Res> collect() {
     const int n = CNE_GetPlacementCount();
     for (int i = 0; i < n; ++i) {
         int32_t pid, sht, plc; double x, y, rt;
-        CNE_GetPlacement(i, &pid, &x, &y, &rt, &sht, &plc);
+        CNE_GetPlacement(i, &pid, &x, &y, &rt, &sht, &plc, nullptr);
         rs.push_back({ pid, x, y, rt, sht, plc });
     }
     return rs;
@@ -246,7 +246,7 @@ int main() {
             std::uniform_real_distribution<double> uLen(250, 900), uTh(3, 15), uAng(0, 180);
             std::uniform_real_distribution<double> uR(60, 150), uT(8, 20), uSpan(180, 300);
             CNE_Begin(W, H, PAD, DIST);
-            CNE_SetOptions(cfg.fix, 15.0, cfg.origin, cfg.dir, 0, cfg.searchBest, 1.5, 4, cfg.seed, 1);
+            CNE_SetOptions(cfg.fix, 15.0, cfg.origin, cfg.dir, 0, cfg.searchBest, 1.5, 4, cfg.seed, 1, 0);
             gRaw.clear(); gId = 0;
             for (int i = 0; i < 28; ++i) addOne(strip(uLen(rng), uTh(rng), uAng(rng), 50 * i, 30 * i));
             for (int i = 0; i < 12; ++i) addOne(cArc(uR(rng), uT(rng), uSpan(rng), 16, 300 + 40 * i, 500));
@@ -291,7 +291,7 @@ int main() {
     {
         const double W = 700, H = 500, PAD = 5, DIST = 4;
         CNE_Begin(W, H, PAD, DIST);
-        CNE_SetOptions(0, 15.0, 0, 0, /*allowInside*/1, 1, 2.0, 4, 42, 1);
+        CNE_SetOptions(0, 15.0, 0, 0, /*allowInside*/1, 1, 2.0, 4, 42, 1, 0);
         gRaw.clear(); gId = 0;
         for (int i = 0; i < 4; ++i) addOne(cArc(120, 22, 260, 22, 300 * i, 300));
         for (int i = 0; i < 18; ++i) addOne(rect(42, 30, 20 * i, 900));
@@ -365,7 +365,7 @@ int main() {
         };
         // allowInside=1 -> everything must fit (squares only fit inside the hole)
         CNE_Begin(220, 220, 5, 4);
-        CNE_SetOptions(1, 15.0, 0, 0, /*allowInside*/1, 0, 1.0, 1, 7, 1);
+        CNE_SetOptions(1, 15.0, 0, 0, /*allowInside*/1, 0, 1.0, 1, 7, 1, 0);
         gRaw.clear(); gId = 0;
         addRings(donut());
         addOne(rect(60, 60, 500, 0));
@@ -398,7 +398,7 @@ int main() {
 
         // allowInside=0 -> hull mode: the hole is blocked, squares spill to sheet #2
         CNE_Begin(220, 220, 5, 4);
-        CNE_SetOptions(1, 15.0, 0, 0, /*allowInside*/0, 0, 1.0, 1, 7, 1);
+        CNE_SetOptions(1, 15.0, 0, 0, /*allowInside*/0, 0, 1.0, 1, 7, 1, 0);
         gRaw.clear(); gId = 0;
         addRings(donut());
         addOne(rect(60, 60, 500, 0));
@@ -421,7 +421,7 @@ int main() {
     {
         const double W = 1000, H = 1000, PAD = 5, DIST = 0, S = 90;
         CNE_Begin(W, H, PAD, DIST);
-        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 2.0, 6, 3, 1);   // X, search on
+        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 2.0, 6, 3, 1, 0);   // X, search on
         gRaw.clear(); gId = 0;
         const int perRow = (int)((W - 2 * PAD) / S);       // 11
         const int rows = 6;                                // 66 squares (fast, still exact)
@@ -469,7 +469,7 @@ int main() {
         const double R = 150, PAD = 3, DIST = 2;
         const P C{ 300, 300 };
         CNE_Begin(100, 100, PAD, DIST);       // sheet overridden by container
-        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 2.0, 6, 11, 1);
+        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 2.0, 6, 11, 1, 0);
         setContainer(circle(C.x, C.y, R, 64));
         gRaw.clear(); gId = 0;
         for (int i = 0; i < 18; ++i) addOne(rect(28, 28, 1000 + 40 * i, 0));  // squares
@@ -517,7 +517,7 @@ int main() {
             return !(neg && pos);
         };
         CNE_Begin(100, 100, PAD, DIST);
-        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 1.5, 5, 22, 1);
+        CNE_SetOptions(0, 15.0, 0, 0, 0, 1, 1.5, 5, 22, 1, 0);
         setContainer(tri);
         gRaw.clear(); gId = 0;
         for (int i = 0; i < 16; ++i) addOne(rect(35, 25, 2000 + 50 * i, 0));

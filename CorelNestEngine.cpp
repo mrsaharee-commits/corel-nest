@@ -1,6 +1,6 @@
 // ============================================================================
 //  CorelNestEngine.cpp — Corel-Nesting Engine, high-performance core
-//  v0.5.0  (engine version 106)
+//  v1.0  (engine version 108)
 //
 //  NEW in v0.5 — SPEED + CORRECTNESS:
 //    * evalFixedRot rewritten as two-phase branch & bound over cached
@@ -51,6 +51,11 @@
 #include <cstdlib>
 #include <thread>
 #include <atomic>
+#include "nest_license.h"
+#if defined(_WIN32)
+  #include <windows.h>
+  #pragma comment(lib, "advapi32.lib")   // Reg*/GetVolumeInformation (activation)
+#endif
 
 namespace {
 
@@ -106,6 +111,13 @@ std::vector<Pt> translatePts(const std::vector<Pt>& v, double dx, double dy) {
 std::vector<Pt> negatePts(const std::vector<Pt>& v) {
     std::vector<Pt> o; o.reserve(v.size());
     for (const Pt& p : v) o.push_back({ -p.x, -p.y });
+    return o;
+}
+
+// horizontal mirror (x -> -x); winding flips, callers re-hull/re-orient
+std::vector<Pt> mirrorPts(const std::vector<Pt>& v) {
+    std::vector<Pt> o; o.reserve(v.size());
+    for (const Pt& p : v) o.push_back({ -p.x, p.y });
     return o;
 }
 
@@ -669,6 +681,8 @@ struct Options {
     i32 searchBest = 0; double searchTimerSec = 3.0; i32 searchCount = 4;
     i32 seed = 123456789;
     i32 optimize = 1;              // 0 = greedy/fast (no compaction), 1 = tidy
+    i32 allowMirror = 0;           // 1 = engine may FLIP parts when that packs
+                                   //     tighter (skipped for symmetric parts)
 };
 
 struct GeomDef {
@@ -676,8 +690,13 @@ struct GeomDef {
     std::vector<Pt> allPts;               // all ring points (bbox source)
     std::vector<Pt> hull;                 // convex hull of allPts
     std::vector<std::vector<Pt>> pieces;  // convex decomposition (may be empty -> hull)
-    double simplifyEps = 0.0;             // eps used for pieces (inflation compensation)
+    double simplifyEps = 0.0;             // ACTUAL max deviation introduced by
+                                          // simplification (inflation compensation;
+                                          // 0 for straight shapes -> EXACT gaps)
     double area = 0.0;                    // true material area (outers - holes)
+    bool mirSame = false;                 // mirrored geometry == original
+                                          // (rectangles, circles...) -> mirror
+                                          // orientations are skipped, zero cost
 };
 
 struct PartDef { i32 id; long long geomKey; double area; };
@@ -694,7 +713,7 @@ struct PlacedInst {
 };
 struct SheetState { std::vector<PlacedInst> insts; };
 
-struct PlaceRec { int partIdx; double x, y, rot; int sheet; bool placed; };
+struct PlaceRec { int partIdx; double x, y, rot; int mir; int sheet; bool placed; };
 struct RunOut {
     std::vector<SheetState> sheets;
     std::vector<PlaceRec> recs;
@@ -706,7 +725,7 @@ struct Engine {
     Options opt;
     std::vector<PartDef> parts;
     std::vector<int> pendingIdx;
-    struct Result { i32 id; double x, y, rot; i32 sheet; i32 placed; };
+    struct Result { i32 id; double x, y, rot; i32 mir; i32 sheet; i32 placed; };
     std::vector<Result> results;
     std::vector<SheetState> sheets;
     std::map<long long, GeomDef> geomStore;
@@ -765,14 +784,22 @@ int quantRot(double deg) {
     return rq;
 }
 
-const RotGeom& getRotGeom(long long key, double rotDeg) {
-    const int rq = quantRot(rotDeg);
+// orientation code = quantized rotation + mirror flag in one int
+// (0..35999 = plain rotations, 36000..71999 = mirrored rotations)
+inline int orientCode(double deg, int mir) {
+    return quantRot(deg) + (mir ? 36000 : 0);
+}
+
+const RotGeom& getRotGeom(long long key, int code) {
+    const int rq = code;
     auto it = G->rotCache.find(std::make_pair(key, rq));
     if (it != G->rotCache.end()) return it->second;
     const GeomDef& gd = G->geomStore[key];
+    const bool mirrored = (code >= 36000);
+    const double rotDeg = (code % 36000) / 100.0;
 
-    // raw outline bbox at this rotation defines the position frame
-    std::vector<Pt> rotAll = rotatePts(gd.allPts, rotDeg);
+    // raw outline bbox at this orientation defines the position frame
+    std::vector<Pt> rotAll = rotatePts(mirrored ? mirrorPts(gd.allPts) : gd.allPts, rotDeg);
     BBox b = bboxOf(rotAll);
 
     RotGeom g;
@@ -788,15 +815,18 @@ const RotGeom& getRotGeom(long long key, double rotDeg) {
         // v0.6: coarser (still circumscribed = safe) arcs for part pieces.
         // Letters decompose into many small pieces; PI/4 arcs shave ~40% of
         // the NFP vertices at a sub-quarter-millimetre outward bulge.
-        const double arcStep = isContainer ? (PI / 6.0) : (PI / 4.0);
+        // simple shapes get fine (PI/6) arcs so measured gaps stay near-exact;
+        // many-piece letterforms use PI/4 (still circumscribed = safe) for speed
+        const double arcStep = (isContainer || gd.pieces.size() <= 6) ? (PI / 6.0)
+                                                                      : (PI / 4.0);
         g.piecesI.reserve(gd.pieces.size());
         for (const auto& pc : gd.pieces) {
-            std::vector<Pt> rp = safeHull(rotatePts(pc, rotDeg));
+            std::vector<Pt> rp = safeHull(rotatePts(mirrored ? mirrorPts(pc) : pc, rotDeg));
             rp = translatePts(rp, -b.minx, -b.miny);
             g.piecesI.push_back(r > 1e-12 ? safeHull(offsetConvex(rp, r, arcStep)) : rp);
         }
     } else {
-        std::vector<Pt> rp = safeHull(rotatePts(gd.hull, rotDeg));
+        std::vector<Pt> rp = safeHull(rotatePts(mirrored ? mirrorPts(gd.hull) : gd.hull, rotDeg));
         rp = translatePts(rp, -b.minx, -b.miny);
         g.piecesI.push_back(r > 1e-12 ? safeHull(offsetConvex(rp, r)) : rp);
     }
@@ -811,8 +841,8 @@ const std::vector<NfpPoly>& buildNfp(long long ka, int ra, long long kb, int rb)
     const std::array<long long, 4> k{ ka, (long long)ra, kb, (long long)rb };
     auto it = G->nfpCache.find(k);
     if (it != G->nfpCache.end()) return it->second;
-    const RotGeom& A = getRotGeom(ka, ra / 100.0);
-    const RotGeom& B = getRotGeom(kb, rb / 100.0);
+    const RotGeom& A = getRotGeom(ka, (int)ra);
+    const RotGeom& B = getRotGeom(kb, (int)rb);
     std::vector<NfpPoly> out;
     out.reserve(A.piecesI.size() * B.piecesI.size());
     for (const auto& pa : A.piecesI)
@@ -869,7 +899,7 @@ bool pastDeadline() {
     return G->hasDeadline && std::chrono::steady_clock::now() > G->deadline;
 }
 
-struct Best { bool ok = false; double x = 0, y = 0, score = 1e300; double rotDeg = 0; };
+struct Best { bool ok = false; double x = 0, y = 0, score = 1e300; double rotDeg = 0; int mir = 0; };
 
 // gravity score of a legal position (lower is better)
 inline double gravityScore(double px, double py, double x0, double y0,
@@ -897,21 +927,21 @@ inline double gravityScore(double px, double py, double x0, double y0,
 //      best is skipped without touching a single edge. Edge-bbox prechecks
 //      kill most remaining segment tests.
 void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
-                  double rot, bool hasPref, double prefRot, Best& out,
+                  double rot, int mirFlag, bool hasPref, int prefCode, Best& out,
                   bool fullCandidates = true,
                   bool haveCur = false, double curX = 0, double curY = 0) {
-    const RotGeom& rg = getRotGeom(movKey, rot);
+    const int rqMov = orientCode(rot, mirFlag);
+    const RotGeom& rg = getRotGeom(movKey, rqMov);
     const double x0 = G->edgePad, y0 = G->edgePad;
     const double x1 = G->sheetW - G->edgePad - rg.bw;
     const double y1 = G->sheetH - G->edgePad - rg.bh;
     if (x1 < x0 - 1e-9 || y1 < y0 - 1e-9) return;
-    const int rqMov = quantRot(rot);
     // gentle tie-break: prefer the Direction orientation (X->landscape,
     // Y->portrait) only when the fit is otherwise equal (a few mm).
     const bool matchesDir = (G->opt.dirMode == 1) ? (rg.bh >= rg.bw - 1e-9)
                                                    : (rg.bw >= rg.bh - 1e-9);
     const double dirBias = matchesDir ? 0.0 : 3.0;
-    const double prefBonus = (hasPref && std::fabs(rot - prefRot) < 1e-9) ? 1e-3 : 0.0;
+    const double prefBonus = (hasPref && prefCode == rqMov) ? 1e-3 : 0.0;
 
     // ---- cached NFP views (zero geometry copies) ---------------------------
     std::vector<InstNfp> nfps; nfps.reserve(insts.size());
@@ -959,16 +989,28 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
     // primary: resulting skyline (raise it as little as possible -> notch
     // filling). secondary: sweep along the cross axis from the origin.
     // tertiary: hug the gravity axis. (ArtCAM-like bottom-left fill.)
+    // v1.0 ROW-ALIGNED bottom-left-fill scoring. The primary term is the
+    // mover's OWN landing height along the gravity axis (its far edge), NOT a
+    // global skyline: a part that lands in a low row must win even when taller
+    // parts already sit elsewhere on the sheet. (The old global-skyline term
+    // let compaction lift a row-completing part up into the next row once that
+    // row existed - the exact "floating blue piece" the user reported.)
+    // The height is quantized into SKY_Q bands so a couple of millimetres
+    // gained by sinking into the arc seam between two rounded corners can't
+    // beat tens of millimetres of proper left-hug; within a band the cross
+    // (fill-direction) term rules, so rows pack tight from the origin edge.
+    const double SKY_Q = 8.0;
+    (void)otherExtent;
     auto scoreOf = [&](double px, double py) -> double {
         const double thisFar = (G->opt.dirMode == 1)
             ? farEdge(px, rg.bw, G->sheetW, originRight)
             : farEdge(py, rg.bh, G->sheetH, originTop);
-        const double newSky = std::max(otherExtent, thisFar);
+        const double band = std::floor(thisFar / SKY_Q + 1e-9);
         const double ux = originRight ? (x1 - px) : (px - x0);
         const double uy = originTop   ? (y1 - py) : (py - y0);
         const double cross = (G->opt.dirMode == 1) ? uy : ux;   // fill direction
         const double hug   = (G->opt.dirMode == 1) ? ux : uy;   // toward gravity axis
-        return newSky * 1e10 + cross * 1e5 + hug * 10.0 + dirBias - prefBonus;
+        return band * 1e12 + cross * 1e6 + hug * 10.0 + dirBias - prefBonus;
     };
     // exact lower bound of scoreOf over a world-frame box: every term is
     // monotone per axis, and all are minimised at the same corner.
@@ -980,14 +1022,43 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
 
     // ---- phase 1: cheap candidates, scanned best-score-first ---------------
     std::vector<Pt> cand;
-    cand.reserve(totalPieces * 24 + 8);
+    cand.reserve(totalPieces * 28 + 16);
     cand.push_back({ x0, y0 }); cand.push_back({ x1, y0 });
     cand.push_back({ x0, y1 }); cand.push_back({ x1, y1 });
+    const size_t rawStart = cand.size();
     for (const InstNfp& f : nfps)
         for (const NfpPoly& np : *f.polys) {
             for (const Pt& p : np.poly) cand.push_back({ p.x + f.ox, p.y + f.oy });
             addBorderCrossings(np.poly, f.ox, f.oy, x0, y0, x1, y1, cand);
         }
+    // v1.0 BOTTOM-LEFT PROJECTION: rounded-corner inflation means the exact
+    // "sit on the floor next to the last part" point is often NOT an NFP
+    // vertex - so a part that could complete a row instead floated onto the
+    // next one (the gap the user saw). Project the structural candidates onto
+    // the origin walls: (x, floor) drops down, (wall, y) slides in.
+    //
+    // Only DISTINCT columns/rows are projected (deduped to 0.1 mm), not every
+    // NFP vertex: a concave part decomposes into many pieces sharing the same
+    // few x/y edges, so projecting each raw point would multiply the candidate
+    // set several-fold (it tripled the concave nest time). Deduping keeps the
+    // projection count tied to the geometry, not the piece-pair count.
+    const double wallX = originRight ? x1 : x0;      // toward the origin corner
+    const double wallY = originTop   ? y1 : y0;
+    const size_t rawEnd = cand.size();
+    std::vector<double> projX, projY;
+    projX.reserve(rawEnd - rawStart); projY.reserve(rawEnd - rawStart);
+    for (size_t i = rawStart; i < rawEnd; ++i) {
+        projX.push_back(cand[i].x);
+        projY.push_back(cand[i].y);
+    }
+    auto dedupe = [](std::vector<double>& v) {
+        for (double& d : v) d = std::floor(d * 10.0 + 0.5) / 10.0;   // 0.1 mm grid
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+    };
+    dedupe(projX); dedupe(projY);
+    for (double px : projX) cand.push_back({ px, wallY });   // drop to the floor
+    for (double py : projY) cand.push_back({ wallX, py });   // slide to the wall
     if (haveCur) cand.push_back({ curX, curY });   // let the current spot compete
 
     struct SC { double sc; Pt p; };
@@ -1004,7 +1075,8 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
     for (const SC& s : scand) {
         if (s.sc >= out.score) break;              // sorted: nothing better left
         if (!isLegal(s.p.x, s.p.y)) continue;
-        out.ok = true; out.score = s.sc; out.x = s.p.x; out.y = s.p.y; out.rotDeg = rot;
+        out.ok = true; out.score = s.sc; out.x = s.p.x; out.y = s.p.y;
+        out.rotDeg = rot; out.mir = mirFlag;
         break;
     }
 
@@ -1134,7 +1206,8 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
                     const double sc = scoreOf(ip.x, ip.y);
                     if (sc >= out.score) continue;
                     if (!isLegal(ip.x, ip.y)) continue;
-                    out.ok = true; out.score = sc; out.x = ip.x; out.y = ip.y; out.rotDeg = rot;
+                    out.ok = true; out.score = sc; out.x = ip.x; out.y = ip.y;
+                    out.rotDeg = rot; out.mir = mirFlag;
                 }
             }
         }
@@ -1143,7 +1216,7 @@ void evalFixedRot(const std::vector<PlacedInst>& insts, long long movKey,
 
 void considerSheet(const SheetState& sh, long long movKey,
                    const std::vector<double>& rots,
-                   bool hasPref, double prefRot, Best& out) {
+                   bool hasPref, int prefCode, Best& out) {
     // Try EVERY allowed rotation and keep the one that packs tightest (best
     // gravity score) — i.e. rotate each part by 90 deg (or the allowed step)
     // to minimise waste, exactly like ArtCAM. The Direction option only sets
@@ -1151,8 +1224,14 @@ void considerSheet(const SheetState& sh, long long movKey,
     // NOT force every part to one orientation (that was the cause of the
     // scattered top with big gaps). A tiny bias still breaks true ties toward
     // the Direction so equal-fit parts line up neatly.
-    for (double rot : rots)
-        evalFixedRot(sh.insts, movKey, rot, hasPref, prefRot, out);
+    // v1.0: optional smart mirroring - each rotation is also tried FLIPPED
+    // and the tighter option wins. Parts whose mirror equals themselves
+    // (rectangles, circles, symmetric shapes) skip the extra work entirely.
+    const bool tryMir = (G->opt.allowMirror != 0) && !G->geomStore[movKey].mirSame;
+    for (double rot : rots) {
+        evalFixedRot(sh.insts, movKey, rot, 0, hasPref, prefCode, out);
+        if (tryMir) evalFixedRot(sh.insts, movKey, rot, 1, hasPref, prefCode, out);
+    }
 }
 
 // Gravity compaction: repeatedly pull each real part toward the origin corner
@@ -1175,8 +1254,8 @@ void compactSheet(SheetState& sh) {
         std::vector<size_t> order(n);
         for (size_t i = 0; i < n; ++i) order[i] = i;
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            const RotGeom& ra = getRotGeom(sh.insts[a].geomKey, sh.insts[a].rotQ / 100.0);
-            const RotGeom& rb = getRotGeom(sh.insts[b].geomKey, sh.insts[b].rotQ / 100.0);
+            const RotGeom& ra = getRotGeom(sh.insts[a].geomKey, sh.insts[a].rotQ);
+            const RotGeom& rb = getRotGeom(sh.insts[b].geomKey, sh.insts[b].rotQ);
             double sa = gravityScore(sh.insts[a].x, sh.insts[a].y, x0, y0,
                                      G->sheetW - G->edgePad - ra.bw, G->sheetH - G->edgePad - ra.bh);
             double sb = gravityScore(sh.insts[b].x, sh.insts[b].y, x0, y0,
@@ -1192,10 +1271,12 @@ void compactSheet(SheetState& sh) {
             std::vector<PlacedInst> others;
             others.reserve(n - 1);
             for (size_t j = 0; j < n; ++j) if (j != i) others.push_back(sh.insts[j]);
-            const double rotDeg = sh.insts[i].rotQ / 100.0;
+            const int code = sh.insts[i].rotQ;
+            const double rotDeg = (code % 36000) / 100.0;
+            const int mirF = (code >= 36000) ? 1 : 0;
             const double cx = sh.insts[i].x, cy = sh.insts[i].y;
             Best b;                                        // current spot competes
-            evalFixedRot(others, sh.insts[i].geomKey, rotDeg, false, 0.0, b, full,
+            evalFixedRot(others, sh.insts[i].geomKey, rotDeg, mirF, false, 0, b, full,
                          /*haveCur*/true, cx, cy);
             if (b.ok && (std::fabs(b.x - cx) > 1e-6 || std::fabs(b.y - cy) > 1e-6)) {
                 sh.insts[i].x = b.x; sh.insts[i].y = b.y;
@@ -1221,7 +1302,7 @@ RunOut runOrder(const std::vector<int>& order,
     for (SheetState& sh : R.sheets)
         for (PlacedInst& in : sh.insts) in.recIdx = -1;
     R.recs.reserve(order.size());
-    std::map<long long, double> prefRot;
+    std::map<long long, int> prefCode;      // preferred orientation CODE per geometry
     const std::vector<double> rots = rotationList(G->opt);
     int done = 0;
     for (int idx : order) {
@@ -1229,8 +1310,8 @@ RunOut runOrder(const std::vector<int>& order,
         heartbeat((int)std::min(99.0, 100.0 * done / std::max<size_t>(1, order.size())));
         ++done;
         const PartDef& pd = G->parts[idx];
-        const bool hasPref = prefRot.count(pd.geomKey) > 0;
-        const double pr = hasPref ? prefRot[pd.geomKey] : 0.0;
+        const bool hasPref = prefCode.count(pd.geomKey) > 0;
+        const int pr = hasPref ? prefCode[pd.geomKey] : 0;
         Best best; int bestSheet = -1;
         for (size_t s = (size_t)barrier; s < R.sheets.size(); ++s) {
             Best b; considerSheet(R.sheets[s], pd.geomKey, rots, hasPref, pr, b);
@@ -1250,18 +1331,19 @@ RunOut runOrder(const std::vector<int>& order,
         }
         PlaceRec rec; rec.partIdx = idx;
         if (best.ok) {
-            const RotGeom& rg = getRotGeom(pd.geomKey, best.rotDeg);
+            const int code = orientCode(best.rotDeg, best.mir);
+            const RotGeom& rg = getRotGeom(pd.geomKey, code);
             PlacedInst in;
-            in.geomKey = pd.geomKey; in.rotQ = quantRot(best.rotDeg);
+            in.geomKey = pd.geomKey; in.rotQ = code;
             in.x = best.x; in.y = best.y; in.bw = rg.bw; in.bh = rg.bh;
             in.recIdx = (int)R.recs.size();       // this rec is pushed next
             R.sheets[bestSheet].insts.push_back(in);
-            rec.x = best.x; rec.y = best.y; rec.rot = best.rotDeg;
+            rec.x = best.x; rec.y = best.y; rec.rot = best.rotDeg; rec.mir = best.mir;
             rec.sheet = bestSheet; rec.placed = true;
-            prefRot[pd.geomKey] = best.rotDeg;
+            prefCode[pd.geomKey] = code;
             ++R.placedCount;
         } else {
-            rec.x = 0; rec.y = 0; rec.rot = 0; rec.sheet = -1; rec.placed = false;
+            rec.x = 0; rec.y = 0; rec.rot = 0; rec.mir = 0; rec.sheet = -1; rec.placed = false;
         }
         R.recs.push_back(rec);
     }
@@ -1344,22 +1426,58 @@ long long internGeom(std::vector<std::vector<Pt>> rings, int maxPieces, bool con
         // v0.6 PIECE BUDGET: the placement cost is quadratic in the number of
         // convex pieces (NFP count = piecesA x piecesB), so complex letterforms
         // must not decompose into dozens of slivers. The simplification eps is
-        // escalated until the part fits the budget; the minimum-distance
-        // guarantee is untouched because eps is added to the inflation radius.
-        // eps stays proportional to the part size so small diacritics keep
-        // their shape.
+        // escalated until the part fits the budget.
+        //
+        // v1.0 EXACT COMPENSATION: the inflation used to add the WHOLE eps as
+        // a safety margin even when simplification removed nothing - a plain
+        // square was kept 2 x 0.15 mm further from its neighbours than asked
+        // (the "5 mm becomes 5.3 mm" report). Rings are now simplified up
+        // front and the TRUE maximum deviation is measured; straight shapes
+        // measure 0.000 and get EXACT spacing, curves get exactly what their
+        // simplification really cost.
         BBox pb = bboxOf(all);
         const double epsCap = container ? 0.15
             : std::min(2.0, std::max(0.15, 0.02 * std::max(pb.maxx - pb.minx,
                                                            pb.maxy - pb.miny)));
         const int pieceBudget = 16;
+        // true deviation of simplified rings vs the originals
+        auto devOf = [](const std::vector<std::vector<Pt>>& orig,
+                        const std::vector<std::vector<Pt>>& simp) {
+            double worst2 = 0.0;
+            const size_t nr = std::min(orig.size(), simp.size());
+            for (size_t ri = 0; ri < nr; ++ri) {
+                const auto& sp = simp[ri];
+                const size_t m = sp.size();
+                if (m < 2) continue;
+                for (const Pt& q : orig[ri]) {
+                    double best2 = 1e300;
+                    for (size_t i = 0; i < m; ++i) {
+                        const Pt& a = sp[i]; const Pt& b = sp[(i + 1) % m];
+                        const double ex = b.x - a.x, ey = b.y - a.y;
+                        const double L2 = ex * ex + ey * ey;
+                        double t = (L2 < 1e-18) ? 0.0
+                            : ((q.x - a.x) * ex + (q.y - a.y) * ey) / L2;
+                        if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+                        const double dx = q.x - (a.x + t * ex);
+                        const double dy = q.y - (a.y + t * ey);
+                        const double d2 = dx * dx + dy * dy;
+                        if (d2 < best2) best2 = d2;
+                    }
+                    if (best2 > worst2) worst2 = best2;
+                }
+            }
+            return std::sqrt(worst2);
+        };
         double eps = 0.15;
         std::vector<std::vector<Pt>> lastGood;
         double lastEps = 0.15;
         for (int attempt = 0; attempt < 6; ++attempt) {
+            std::vector<std::vector<Pt>> rings2;
+            rings2.reserve(rings.size());
+            for (const auto& r : rings) rings2.push_back(simplifyRing(r, eps));
             std::vector<std::vector<Pt>> ps =
-                container ? vertDecompose(rings, eps)
-                          : decomposeRegion(rings, eps, maxPieces);
+                container ? vertDecompose(rings2, 1e-9)
+                          : decomposeRegion(rings2, 1e-9, maxPieces);
             if (!ps.empty()) { lastGood = std::move(ps); lastEps = eps; }
             if (!lastGood.empty() &&
                 (container || (int)lastGood.size() <= pieceBudget)) break;
@@ -1367,7 +1485,32 @@ long long internGeom(std::vector<std::vector<Pt>> rings, int maxPieces, bool con
             eps *= 2.0;
         }
         gd.pieces = std::move(lastGood);
-        gd.simplifyEps = gd.pieces.empty() ? 0.0 : lastEps;
+        // measure the TRUE deviation ONCE, only for the accepted eps (running
+        // it inside the escalation loop wasted O(P x S) on discarded attempts)
+        if (gd.pieces.empty()) {
+            gd.simplifyEps = 0.0;
+        } else {
+            std::vector<std::vector<Pt>> finalRings;
+            finalRings.reserve(rings.size());
+            for (const auto& r : rings) finalRings.push_back(simplifyRing(r, lastEps));
+            gd.simplifyEps = devOf(rings, finalRings);
+        }
+        // mirror symmetry: same (quantized) point multiset after normalization
+        // -> the mirrored orientations can never differ, skip them for free.
+        {
+            std::vector<Pt> mir = mirrorPts(all);
+            BBox mb = bboxOf(mir);
+            std::vector<std::pair<long long, long long>> qa, qb;
+            qa.reserve(all.size()); qb.reserve(mir.size());
+            for (const Pt& q : all)
+                qa.push_back({ llround(q.x * 1000.0), llround(q.y * 1000.0) });
+            for (const Pt& q : mir)
+                qb.push_back({ llround((q.x - mb.minx) * 1000.0),
+                               llround((q.y - mb.miny) * 1000.0) });
+            std::sort(qa.begin(), qa.end());
+            std::sort(qb.begin(), qb.end());
+            gd.mirSame = (qa == qb);
+        }
         G->geomStore[key] = std::move(gd);
     }
     return key;
@@ -1382,7 +1525,7 @@ i32 addPartRings(i32 partId, std::vector<std::vector<Pt>> rings) {
     pd.area = G->geomStore[key].area;
     G->parts.push_back(pd);
     G->pendingIdx.push_back((int)G->parts.size() - 1);
-    Engine::Result r; r.id = partId; r.x = 0; r.y = 0; r.rot = 0; r.sheet = -1; r.placed = 0;
+    Engine::Result r; r.id = partId; r.x = 0; r.y = 0; r.rot = 0; r.mir = 0; r.sheet = -1; r.placed = 0;
     G->results.push_back(r);
     return (i32)G->parts.size() - 1;
 }
@@ -1392,7 +1535,7 @@ i32 addPartRings(i32 partId, std::vector<std::vector<Pt>> rings) {
 SheetState makeFreshSheet() {
     SheetState s;
     if (G->containerKey != 0) {
-        const RotGeom& rg = getRotGeom(G->containerKey, 0.0);
+        const RotGeom& rg = getRotGeom(G->containerKey, 0);
         PlacedInst in;
         in.geomKey = G->containerKey; in.rotQ = 0;
         in.x = 0; in.y = 0; in.bw = rg.bw; in.bh = rg.bh;
@@ -1407,10 +1550,76 @@ SheetState makeFreshSheet() {
 // ===========================================================================
 // Exported C API
 // ===========================================================================
-CNE_API i32 CNE_CALL CNE_Version(void) { return 107; }
+// ---------------------------------------------------------------------------
+// v1.0 machine-locked activation. The DLL refuses to start an engine unless a
+// valid activation code (matching THIS computer's machine code) was stored.
+// Non-Windows builds (Linux test harness) are always considered licensed.
+// ---------------------------------------------------------------------------
+namespace {
+uint32_t machineFingerprint() {
+#if defined(_WIN32)
+    DWORD serial = 0;
+    GetVolumeInformationW(L"C:\\", nullptr, 0, &serial, nullptr, nullptr, nullptr, 0);
+    wchar_t name[64] = { 0 };
+    DWORD len = 64;
+    GetComputerNameW(name, &len);
+    unsigned long long h = nestlic::fnv64(&serial, sizeof serial);
+    h = nestlic::fnv64(name, (size_t)len * sizeof(wchar_t), h);
+    uint32_t fp = (uint32_t)(h ^ (h >> 32));
+    if (fp == 0) fp = 0x1A2B3C4Du;
+    return fp;
+#else
+    return 0;
+#endif
+}
+bool gLicOk = false;
+bool gLicChecked = false;
+bool licensedNow() {
+#if !defined(_WIN32)
+    (void)gLicOk; (void)gLicChecked;
+    return true;                        // test builds: no license gate
+#else
+    if (gLicChecked) return gLicOk;
+    gLicChecked = true;
+    gLicOk = false;
+    wchar_t buf[80] = { 0 };
+    DWORD sz = sizeof buf;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\MA_NestingTool", L"Activation",
+                     RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS) {
+        gLicOk = (nestlic::parseHex(buf) ==
+                  nestlic::activationFor(machineFingerprint()));
+    }
+    return gLicOk;
+#endif
+}
+} // namespace
+
+CNE_API i32 CNE_CALL CNE_Version(void) { return 108; }
+
+// 8-hex machine code shown to the user (send it to get an activation code)
+CNE_API i32 CNE_CALL CNE_GetMachineCode(void) { return (i32)machineFingerprint(); }
+
+CNE_API i32 CNE_CALL CNE_IsLicensed(void) { return licensedNow() ? 1 : 0; }
+
+// codePtr = pointer to a wide (VBA) string with the 16-hex activation code
+// (dashes/spaces allowed). Stores it for this user on success.
+CNE_API i32 CNE_CALL CNE_Activate(const wchar_t* codePtr) {
+#if !defined(_WIN32)
+    (void)codePtr; return 1;
+#else
+    if (!codePtr) return 0;
+    if (nestlic::parseHex(codePtr) != nestlic::activationFor(machineFingerprint()))
+        return 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\MA_NestingTool", L"Activation",
+                    REG_SZ, codePtr, (DWORD)((wcslen(codePtr) + 1) * sizeof(wchar_t)));
+    gLicChecked = false;
+    return licensedNow() ? 1 : 0;
+#endif
+}
 
 CNE_API i32 CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                double edgePad, double minDist) {
+    if (!licensedNow()) return 0;      // not activated on this computer
     if (sheetW <= 1.0 || sheetH <= 1.0) return 0;
     if (gAsyncState.load() == 1) { gAsyncAbort.store(true); }
     joinWorker();
@@ -1434,7 +1643,7 @@ CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
                                     i32 originCorner, i32 dirMode,
                                     i32 allowInside, i32 searchBest,
                                     double searchTimerSec, i32 searchCount,
-                                    i32 seed, i32 optimize) {
+                                    i32 seed, i32 optimize, i32 allowMirror) {
     if (!G || gAsyncState.load() == 1) return 0;
     G->opt.fixAngleMode = fixAngleMode;
     G->opt.rotStepDeg = rotStepDeg;
@@ -1446,6 +1655,7 @@ CNE_API i32 CNE_CALL CNE_SetOptions(i32 fixAngleMode, double rotStepDeg,
     G->opt.searchCount = searchCount;
     G->opt.seed = seed;
     G->opt.optimize = optimize;
+    G->opt.allowMirror = allowMirror;
     G->rng.seed((unsigned)seed);
     G->rotCache.clear();          // mode-dependent caches
     G->nfpCache.clear();
@@ -1603,7 +1813,7 @@ i32 runImpl(i32 keepExisting) {
     G->sheets = best.sheets;
     for (const PlaceRec& rec : best.recs) {
         Engine::Result& rs = G->results[(size_t)rec.partIdx];
-        rs.x = rec.x; rs.y = rec.y; rs.rot = rec.rot;
+        rs.x = rec.x; rs.y = rec.y; rs.rot = rec.rot; rs.mir = rec.mir;
         rs.sheet = rec.sheet; rs.placed = rec.placed ? 1 : 0;
     }
     G->fitness = best.fitness;
@@ -1672,7 +1882,8 @@ CNE_API i32 CNE_CALL CNE_GetPlacementCount(void) {
 
 CNE_API i32 CNE_CALL CNE_GetPlacement(i32 index, i32* partId,
                                       double* leftX, double* bottomY,
-                                      double* rotDeg, i32* sheetIndex, i32* placed) {
+                                      double* rotDeg, i32* sheetIndex, i32* placed,
+                                      i32* mirrored) {
     if (!G || index < 0 || index >= (i32)G->results.size()) return 0;
     const Engine::Result& r = G->results[(size_t)index];
     // container results map back to the caller's coordinate frame
@@ -1684,6 +1895,7 @@ CNE_API i32 CNE_CALL CNE_GetPlacement(i32 index, i32* partId,
     if (rotDeg)     *rotDeg = r.rot;
     if (sheetIndex) *sheetIndex = r.sheet;
     if (placed)     *placed = r.placed;
+    if (mirrored)   *mirrored = r.mir;
     return 1;
 }
 

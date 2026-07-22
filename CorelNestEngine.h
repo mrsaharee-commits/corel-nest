@@ -40,7 +40,7 @@
 typedef int32_t (CNE_CALL *CNE_ProgressFn)(int32_t percent);
 
 // ---- lifecycle -------------------------------------------------------------
-CNE_API int32_t CNE_CALL CNE_Version(void);   // 107 = v0.6.0 (async runs + letters fast path)
+CNE_API int32_t CNE_CALL CNE_Version(void);   // 108 = v1.0 (mirroring, exact gaps, license)
 CNE_API int32_t CNE_CALL CNE_Begin(double sheetW, double sheetH,
                                    double edgePad, double minDist);
 CNE_API int32_t CNE_CALL CNE_End(void);
@@ -59,11 +59,14 @@ CNE_API int32_t CNE_CALL CNE_End(void);
 //                     parts nest inside C/U cavities and inside holes
 //  optimize     : 0 = greedy/fast (skip the tidy compaction pass)
 //                 1 = tidy (run compaction to remove gaps; a little slower)
+//  allowMirror  : 1 = the engine may FLIP parts when that packs tighter
+//                 (parts whose mirror equals themselves are skipped for free)
 CNE_API int32_t CNE_CALL CNE_SetOptions(int32_t fixAngleMode, double rotStepDeg,
                                         int32_t originCorner, int32_t dirMode,
                                         int32_t allowInside, int32_t searchBest,
                                         double searchTimerSec, int32_t searchCount,
-                                        int32_t seed, int32_t optimize);
+                                        int32_t seed, int32_t optimize,
+                                        int32_t allowMirror);
 CNE_API int32_t CNE_CALL CNE_SetProgressCallback(CNE_ProgressFn fn);
 
 // Arbitrary container: parts nest INSIDE this outline (rectangle, circle,
@@ -105,11 +108,20 @@ CNE_API int32_t CNE_CALL CNE_RunStatus(void);
 CNE_API int32_t CNE_CALL CNE_GetAsyncPct(void);
 CNE_API int32_t CNE_CALL CNE_AbortRun(void);
 
+// ---- v1.0 machine-locked activation ----------------------------------------
+//  CNE_GetMachineCode : 8-hex fingerprint of this computer (show to the user)
+//  CNE_Activate       : wide string with the activation code; 1 = accepted
+//  CNE_IsLicensed     : 1 = this computer is activated (CNE_Begin refuses if 0)
+CNE_API int32_t CNE_CALL CNE_GetMachineCode(void);
+CNE_API int32_t CNE_CALL CNE_Activate(const wchar_t* codePtr);
+CNE_API int32_t CNE_CALL CNE_IsLicensed(void);
+
 // ---- results ---------------------------------------------------------------
 CNE_API int32_t CNE_CALL CNE_GetPlacementCount(void);
+//  mirrored: 1 = apply a horizontal flip BEFORE the rotation
 CNE_API int32_t CNE_CALL CNE_GetPlacement(int32_t index, int32_t* partId,
                                           double* leftX, double* bottomY,
                                           double* rotDeg, int32_t* sheetIndex,
-                                          int32_t* placed);
+                                          int32_t* placed, int32_t* mirrored);
 CNE_API int32_t CNE_CALL CNE_GetSheetCount(void);
 CNE_API double  CNE_CALL CNE_GetFitness(void);

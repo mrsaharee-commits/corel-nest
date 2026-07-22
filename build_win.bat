@@ -18,6 +18,14 @@ if errorlevel 1 (
 )
 
 echo.
+echo --- building the activation keygen (KEEP nest_keygen.exe PRIVATE!) ---
+cl /nologo /O2 /EHsc /MT nest_keygen.cpp /Fe:nest_keygen.exe
+if errorlevel 1 (
+    echo KEYGEN BUILD FAILED
+    exit /b 1
+)
+
+echo.
 echo --- building the console self-test (optional but recommended) ---
 cl /nologo /O2 /EHsc /MT CorelNestEngine.cpp test_harness.cpp /Fe:nest_test.exe
 if errorlevel 1 (

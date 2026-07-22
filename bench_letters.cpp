@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
 
     CNE_Begin(1220, 2440, 15, 5);
     CNE_SetOptions(0, 15, 0, 0, /*allowInside*/1, doSearch ? 1 : 0,
-                   20, 40, 20260711, /*optimize*/1);
+                   20, 40, 20260711, /*optimize*/1, 0);
     gid = 0;
     // 31 parts: mixed letter sizes like the screenshot (big 300-500 mm letters,
     // medium 200 mm, small diacritics)

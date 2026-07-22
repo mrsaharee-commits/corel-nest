@@ -96,7 +96,7 @@ static std::vector<Placement> readAll() {
     std::vector<Placement> out;
     for (int i = 0; i < CNE_GetPlacementCount(); ++i) {
         Placement pl; int32_t pid, sh, pc; double x, y, r;
-        CNE_GetPlacement(i, &pid, &x, &y, &r, &sh, &pc);
+        CNE_GetPlacement(i, &pid, &x, &y, &r, &sh, &pc, nullptr);
         pl.id = pid; pl.sheet = sh; pl.placed = pc; pl.x = x; pl.y = y; pl.rot = r;
         out.push_back(pl);
     }
@@ -138,7 +138,7 @@ int main() {
         for (int i = 0; i < 12; ++i) shapes[++id] = rect(35 + (i % 3) * 8, 500 + (i % 4) * 60);
 
         CNE_Begin(1220, 2440, 5, 15);
-        CNE_SetOptions(0, 15, 0, 0, 0, 0, 10, 1, 20260711, 1);
+        CNE_SetOptions(0, 15, 0, 0, 0, 0, 10, 1, 20260711, 1, 0);
         for (auto& kv : shapes) addPart(kv.first, kv.second);
         auto t0 = CK::now();
         int placed = CNE_Run(0);
@@ -159,7 +159,7 @@ int main() {
         for (int i = 0; i < 12; ++i) shapes[++id] = rect(35 + (i % 3) * 8, 500 + (i % 4) * 60);
 
         CNE_Begin(1220, 2440, 5, 15);
-        CNE_SetOptions(0, 15, 0, 0, 0, 1, 10, 8, 20260711, 1);
+        CNE_SetOptions(0, 15, 0, 0, 0, 1, 10, 8, 20260711, 1, 0);
         for (auto& kv : shapes) addPart(kv.first, kv.second);
         auto t0 = CK::now();
         int placed = CNE_Run(0);
@@ -178,7 +178,7 @@ int main() {
         for (int i = 0; i < 22; ++i) shapes[++id] = roundedRect(45 + (i % 4) * 12, 45 + (i % 3) * 14, 8, 8);
 
         CNE_Begin(1220, 2440, 5, 4);
-        CNE_SetOptions(0, 15, 0, 0, 1, 0, 10, 1, 20260711, 1);
+        CNE_SetOptions(0, 15, 0, 0, 1, 0, 10, 1, 20260711, 1, 0);
         for (auto& kv : shapes) addPart(kv.first, kv.second);
         auto t0 = CK::now();
         int placed = CNE_Run(0);
@@ -196,7 +196,7 @@ int main() {
         std::map<int, std::vector<P>> shapes;
         int id = 0;
         CNE_Begin(1220, 2440, 5, 8);
-        CNE_SetOptions(0, 15, 0, 0, 0, 0, 5, 1, 20260711, 1);
+        CNE_SetOptions(0, 15, 0, 0, 0, 0, 5, 1, 20260711, 1, 0);
         for (int i = 0; i < 20; ++i) {
             shapes[++id] = roundedRect(150 + (i % 5) * 40, 260 + (i % 4) * 45, 18, 10);
             addPart(id, shapes[id]);
@@ -222,7 +222,7 @@ int main() {
     {
         std::map<int, std::vector<P>> shapes;
         CNE_Begin(1000, 560, 0, 5);
-        CNE_SetOptions(1, 15, 0, 0, 0, 0, 5, 1, 42, 1);
+        CNE_SetOptions(1, 15, 0, 0, 0, 0, 5, 1, 42, 1, 0);
         for (int i = 1; i <= 66; ++i) { shapes[i] = rect(85, 85); addPart(i, shapes[i]); }
         auto t0 = CK::now();
         int placed = CNE_Run(0);
