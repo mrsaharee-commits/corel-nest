@@ -53,11 +53,15 @@
 #include <atomic>
 #include "nest_license.h"
 #if defined(_WIN32)
-  #define NOMINMAX
+  #ifndef NOMINMAX
+    #define NOMINMAX               // منع windows.h من تعريف ماكرو min/max الذي يكسر std::min/std::max
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
   #include <windows.h>
   #pragma comment(lib, "advapi32.lib")   // Reg*/GetVolumeInformation (activation)
 #endif
-
 
 namespace {
 
