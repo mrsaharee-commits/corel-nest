@@ -2,7 +2,11 @@ name: build-CorelNestEngine-dll
 
 # يبني CorelNestEngine.dll (64-بت) على خادم ويندوز بمترجم MSVC،
 # ينشئ ملف الترخيص من GitHub Secret أثناء البناء،
-# يشغّل الاختبار الذاتي، ثم يتيح الـ DLL للتنزيل كـ Artifact.
+# ثم يتيح الـ DLL للتنزيل كـ Artifact.
+#
+# ملاحظة: أُزيلت خطوة الاختبار الذاتي (nest_test) لأن نظام التفعيل في v1.0
+# يرفض CNE_Begin على أي جهاز غير مُفعَّل — وخادم GitHub مؤقت وغير مُفعَّل،
+# فلا يمكن تشغيل الاختبار هنا. تحقّق من الأداة على جهازك المُفعَّل بدل ذلك.
 
 on:
   workflow_dispatch:
@@ -18,7 +22,7 @@ jobs:
 
       # إنشاء ملف الترخيص مؤقتاً أثناء البناء.
       # السر يُمرَّر عبر env: (متغيّر بيئة) وليس مباشرة داخل نص السكربت،
-      # لأن الملف متعدد الأسطر — لصقه نصياً داخل echo كان يكسر أمر bash.
+      # لأن الملف متعدد الأسطر — لصقه نصياً داخل echo يكسر أمر bash.
       - name: Create nest_license.h
         shell: bash
         env:
@@ -36,9 +40,6 @@ jobs:
 
       - name: Build (Release)
         run: cmake --build build --config Release
-
-      - name: Run self-test (nest_test)
-        run: ctest --test-dir build -C Release --output-on-failure
 
       - name: List output
         run: dir build\Release
