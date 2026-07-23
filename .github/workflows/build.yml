@@ -16,15 +16,20 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      # إنشاء ملف الترخيص مؤقتاً أثناء البناء
+      # إنشاء ملف الترخيص مؤقتاً أثناء البناء.
+      # السر يُمرَّر عبر env: (متغيّر بيئة) وليس مباشرة داخل نص السكربت،
+      # لأن الملف متعدد الأسطر — لصقه نصياً داخل echo كان يكسر أمر bash.
       - name: Create nest_license.h
         shell: bash
+        env:
+          NEST_LICENSE_H: ${{ secrets.NEST_LICENSE_H }}
         run: |
-          if [ -z "${{ secrets.NEST_LICENSE_H }}" ]; then
+          if [ -z "$NEST_LICENSE_H" ]; then
             echo "ERROR: NEST_LICENSE_H secret is not configured"
             exit 1
           fi
-          echo "${{ secrets.NEST_LICENSE_H }}" > nest_license.h
+          printf '%s\n' "$NEST_LICENSE_H" > nest_license.h
+          echo "nest_license.h written, $(wc -l < nest_license.h) lines"
 
       - name: Configure (x64 / MSVC)
         run: cmake -S . -B build -A x64
