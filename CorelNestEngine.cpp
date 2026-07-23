@@ -53,9 +53,11 @@
 #include <atomic>
 #include "nest_license.h"
 #if defined(_WIN32)
+  #define NOMINMAX
   #include <windows.h>
   #pragma comment(lib, "advapi32.lib")   // Reg*/GetVolumeInformation (activation)
 #endif
+
 
 namespace {
 
